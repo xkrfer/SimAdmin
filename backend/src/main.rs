@@ -680,7 +680,9 @@ async fn main() -> Result<()> {
         )
         .route(
             "/api/esim/profiles",
-            get(get_esim_profiles_handler).options(options_handler),
+            get(get_esim_profiles_handler)
+                .post(download_esim_profile_handler)
+                .options(options_handler),
         )
         .route(
             "/api/esim/profiles/{iccid}/enable",

@@ -628,6 +628,125 @@ pub async fn delete_esim_profile_handler(
     }
 }
 
+fn find_and_normalize_profile(value: &serde_json::Value) -> Option<EsimProfile> {
+    if let Some(obj) = value.as_object() {
+        if obj.contains_key("iccid") || obj.contains_key("ICCID") {
+            return Some(crate::esim::normalize_profile(value));
+        }
+        for (_, val) in obj {
+            if let Some(p) = find_and_normalize_profile(val) {
+                return Some(p);
+            }
+        }
+    } else if let Some(arr) = value.as_array() {
+        for val in arr {
+            if let Some(p) = find_and_normalize_profile(val) {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// POST /api/esim/profiles
+pub async fn download_esim_profile_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<EsimDownloadRequest>,
+) -> impl IntoResponse {
+    let smdp = payload.smdp.trim().to_string();
+    let matching_id = payload.matching_id.trim().to_string();
+    if smdp.is_empty() || matching_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<EsimCommandResponse>::error(
+                "SM-DP+ server and Matching ID cannot be empty",
+            )),
+        );
+    }
+
+    match app.esim_supervisor.download_profile(payload.clone()).await {
+        Ok(data) => {
+            if esim_command_succeeded(&data) {
+                // Attempt to recursively find the downloaded profile details in lpac's response
+                let profile_val = data.data.clone().unwrap_or(serde_json::Value::Null);
+                if let Some(mut profile) = find_and_normalize_profile(&profile_val) {
+                    // Supplement SM-DP+ if not returned
+                    if profile.smdp.as_deref().unwrap_or("").trim().is_empty() {
+                        profile.smdp = Some(smdp.clone());
+                    }
+
+                    let entry = EsimProfileCacheEntry {
+                        iccid: profile.iccid.clone(),
+                        name: Some(profile.name),
+                        provider: Some(profile.provider),
+                        profile_class: Some(profile.profile_class),
+                        imsi: profile.imsi,
+                        msisdn: profile.msisdn,
+                        smsc: profile.smsc,
+                        smdp: profile.smdp,
+                        isdp_aid: profile.isdp_aid,
+                        mcc: profile.mcc,
+                        mnc: profile.mnc,
+                        updated_at: chrono::Utc::now().to_rfc3339(),
+                    };
+
+                    if let Err(err) = app.database.upsert_esim_profile_cache(&entry) {
+                        warn!(iccid = %entry.iccid, error = %err, "Failed to cache downloaded eSIM profile to database");
+                    }
+
+                    app.system_event_emitter
+                        .emit_code(
+                            system_event_codes::ESIM_PROFILE_DOWNLOAD_SUCCEEDED,
+                            system_event_severity::INFO,
+                            system_event_status::SUCCEEDED,
+                            mask_identifier(&entry.iccid),
+                            "Profile 写入并缓存成功",
+                        )
+                        .await;
+                } else {
+                    // Fallback if we couldn't parse the profile details from lpac, just log success
+                    app.system_event_emitter
+                        .emit_code(
+                            system_event_codes::ESIM_PROFILE_DOWNLOAD_SUCCEEDED,
+                            system_event_severity::INFO,
+                            system_event_status::SUCCEEDED,
+                            "esim",
+                            "Profile 写入成功",
+                        )
+                        .await;
+                }
+            } else {
+                app.system_event_emitter
+                    .emit_code(
+                        system_event_codes::ESIM_PROFILE_DOWNLOAD_FAILED,
+                        system_event_severity::WARNING,
+                        system_event_status::FAILED,
+                        "esim",
+                        format!("Profile 写入失败: {}", data.msg),
+                    )
+                    .await;
+            }
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message("Profile downloaded", data)),
+            )
+        }
+        Err(err) => {
+            let message = err.message();
+            app.system_event_emitter
+                .emit_code(
+                    system_event_codes::ESIM_PROFILE_DOWNLOAD_FAILED,
+                    system_event_severity::WARNING,
+                    system_event_status::FAILED,
+                    "esim",
+                    format!("Profile 写入失败: {message}"),
+                )
+                .await;
+            esim_error_response::<EsimCommandResponse>(err)
+        }
+    }
+}
+
 // ============ 设备信息 ============
 
 /// GET /api/device

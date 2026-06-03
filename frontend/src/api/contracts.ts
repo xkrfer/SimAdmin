@@ -100,6 +100,13 @@ export interface EsimLpacRepairRequest {
   asset_url?: string
 }
 
+export interface EsimDownloadRequest {
+  smdp: string
+  matching_id: string
+  confirmation_code?: string
+  imei?: string
+}
+
 export interface EsimLpacRepairResponse {
   installed: boolean
   path: string

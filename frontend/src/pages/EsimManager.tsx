@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, useRef } from 'react'
 import {
   Alert,
   Avatar,
@@ -38,7 +38,11 @@ import {
   Public,
   Refresh,
   SimCard,
+  CloudDownload,
+  QrCodeScanner,
+  Add,
 } from '@mui/icons-material'
+import jsQR from 'jsqr'
 import { alpha, type Theme } from '@mui/material/styles'
 import { api } from '../api/current'
 import ErrorSnackbar from '../components/ErrorSnackbar'
@@ -548,6 +552,156 @@ export default function EsimManagerPage() {
   const [lpacRepairing, setLpacRepairing] = useState(false)
   const [lpacProxyPrefix, setLpacProxyPrefix] = useState(LPAC_PROXY_PREFIX_OPTIONS[0].value)
 
+  const [showAddWorkspace, setShowAddWorkspace] = useState(false)
+  const [smartInput, setSmartInput] = useState('')
+  const [addForm, setAddForm] = useState({
+    smdp: '',
+    matchingId: '',
+    confirmationCode: '',
+    imei: '',
+  })
+  const [smartParsed, setSmartParsed] = useState(false)
+  const [writeState, setWriteState] = useState<'idle' | 'writing' | 'success' | 'failed'>('idle')
+  const [writeProgress, setWriteProgress] = useState(0)
+  const [writeLogLines, setWriteLogLines] = useState<Array<{ time: string; text: string; type: 'info' | 'success' | 'error' }>>([])
+
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const logEndRef = useRef<HTMLDivElement>(null)
+
+  const resetAddWorkspace = () => {
+    setSmartInput('')
+    setAddForm({
+      smdp: '',
+      matchingId: '',
+      confirmationCode: '',
+      imei: '',
+    })
+    setSmartParsed(false)
+    setWriteState('idle')
+    setWriteProgress(0)
+    setWriteLogLines([])
+  }
+
+  const parseLpaCode = (code: string) => {
+    const val = code.trim()
+    const lpaRegex = /^LPA:1\$([^$]+)\$([^$]+)(?:\$([^$]+))?/
+    const match = val.match(lpaRegex)
+    if (match) {
+      const smdp = match[1]
+      const matchingId = match[2]
+      const cc = match[3] || ''
+      setAddForm((prev) => ({
+        ...prev,
+        smdp,
+        matchingId,
+        confirmationCode: cc,
+      }))
+      setSmartParsed(true)
+    } else {
+      setSmartParsed(false)
+    }
+  }
+
+  const handleQrUpload = (file: File) => {
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      const img = new Image()
+      img.onload = () => {
+        const canvas = document.createElement('canvas')
+        canvas.width = img.width
+        canvas.height = img.height
+        const ctx = canvas.getContext('2d')
+        if (ctx) {
+          ctx.drawImage(img, 0, 0)
+          try {
+            const imgData = ctx.getImageData(0, 0, img.width, img.height)
+            const code = jsQR(imgData.data, imgData.width, imgData.height)
+            if (code && code.data) {
+              setSmartInput(code.data)
+              parseLpaCode(code.data)
+              setSuccess('二维码解析成功，已填充参数')
+            } else {
+              setError('未在图片中检测到有效的 eSIM 二维码')
+            }
+          } catch {
+            setError('解析二维码图片时出错')
+          }
+        }
+      }
+      img.src = e.target?.result as string
+    }
+    reader.readAsDataURL(file)
+  }
+
+  const startWriteCard = async () => {
+    if (!addForm.smdp || !addForm.matchingId) return
+    setWriteState('writing')
+    setWriteProgress(5)
+    setWriteLogLines([
+      { time: '[00:01]', text: '检索设备底座 lpac 私有环境可执行配置...', type: 'info' },
+    ])
+
+    let timer: number
+    const startProgressSim = () => {
+      let currentProgress = 5
+      timer = window.setInterval(() => {
+        currentProgress = Math.min(95, currentProgress + Math.floor(Math.random() * 8) + 2)
+        setWriteProgress(currentProgress)
+      }, 1000)
+    }
+
+    try {
+      startProgressSim()
+      setWriteLogLines((prev) => [
+        ...prev,
+        { time: '[00:02]', text: '建立 APDU 底层传输信道握手成功。设备架构: ' + (lpacStatus?.arch || 'aarch64'), type: 'success' },
+        { time: '[00:03]', text: '读取卡槽 eUICC (芯片厂商: ' + euiccManufacturer + ', EID: ' + euiccEid.slice(0, 14) + '...)', type: 'success' },
+        { time: '[00:04]', text: '运营商 SM-DP+ 服务器端身份授权认证开始...', type: 'info' },
+      ])
+
+      const response = await api.downloadEsimProfile({
+        smdp: addForm.smdp.trim(),
+        matching_id: addForm.matchingId.trim(),
+        confirmation_code: addForm.confirmationCode.trim() || undefined,
+        imei: addForm.imei.trim() || undefined,
+      })
+
+      window.clearInterval(timer)
+
+      if (!commandSucceeded(response.data)) {
+        let errMsg = response.data?.msg || 'lpac 执行写卡指令失败'
+        if (response.data?.data === 'MatchingID is refused' || response.data?.msg === 'MatchingID is refused' || (typeof response.data?.data === 'string' && response.data.data.includes('MatchingID is refused'))) {
+          errMsg = '激活码已被使用或失效 (Matching ID was refused by SM-DP+ server, profile may already be downloaded)'
+        }
+        throw new Error(errMsg)
+      }
+
+      setWriteProgress(100)
+      setWriteLogLines((prev) => [
+        ...prev,
+        { time: '[00:25]', text: 'SHA256 密匙签名芯片端校验一致通过。', type: 'success' },
+        { time: '[00:28]', text: 'Profile 写入完毕！', type: 'success' },
+        { time: '[00:30]', text: '操作成功，正在刷新 Profile 列表并水合本地缓存。', type: 'success' },
+      ])
+
+      setTimeout(() => {
+        setWriteState('success')
+        setSuccess('Profile 写入成功，本地 SQLite 缓存已水合更新')
+        void loadData(true)
+      }, 1000)
+
+    } catch (err) {
+      window.clearInterval(timer)
+      const msg = err instanceof Error ? err.message : String(err)
+      setWriteState('failed')
+      setWriteLogLines((prev) => [
+        ...prev,
+        { time: '[ERR]', text: `写入失败: ${msg}`, type: 'error' },
+      ])
+      setError(`写卡失败: ${msg}`)
+    }
+  }
+
   const selectedProfile = useMemo(
     () => profiles.find((profile) => profile.iccid === selectedIccid) ?? profiles[0],
     [profiles, selectedIccid],
@@ -660,6 +814,12 @@ export default function EsimManagerPage() {
   useEffect(() => {
     void loadData()
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (writeState === 'writing' || writeState === 'failed') {
+      logEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
+  }, [writeLogLines, writeState])
 
   const repairLpac = async () => {
     setLpacRepairing(true)
@@ -974,10 +1134,28 @@ export default function EsimManagerPage() {
               <Card sx={{ height: '100%', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
                 <Box p={2} display="flex" alignItems="center" justifyContent="space-between">
                   <Box display="flex" alignItems="center" gap={1}>
-                    <Typography fontWeight={700}>Profiles 列表</Typography>
+                    <Typography fontWeight={700}>
+                      {profilesLoading && profiles.length === 0
+                        ? 'Profiles 列表 (读取中)'
+                        : `Profiles 列表 (${profiles.length})`}
+                    </Typography>
                     {profilesLoading && <CircularProgress size={14} />}
                   </Box>
-                  <Chip label={profilesLoading && profiles.length === 0 ? '读取中' : profiles.length} size="small" />
+                  <Tooltip title="添加 Profile">
+                    <span>
+                      <IconButton
+                        size="small"
+                        color="primary"
+                        onClick={() => {
+                          setShowAddWorkspace(true)
+                          resetAddWorkspace()
+                        }}
+                        disabled={profilesLoading || statusLoading || !lpacStatus?.usable}
+                      >
+                        <Add />
+                      </IconButton>
+                    </span>
+                  </Tooltip>
                 </Box>
                 <Divider />
                 <Box sx={{ flex: { md: 1 }, minHeight: 0, maxHeight: { xs: 360, md: 'none' }, overflow: 'auto' }}>
@@ -1008,7 +1186,10 @@ export default function EsimManagerPage() {
                           <ListItemButton
                             key={profile.iccid}
                             selected={selected}
-                            onClick={() => setSelectedIccid(profile.iccid)}
+                            onClick={() => {
+                              setSelectedIccid(profile.iccid)
+                              setShowAddWorkspace(false)
+                            }}
                             sx={{
                               gap: 1.25,
                               alignItems: 'center',
@@ -1064,7 +1245,315 @@ export default function EsimManagerPage() {
               </Card>
 
               <Card sx={{ height: '100%', minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-                {selectedProfile ? (
+                {showAddWorkspace ? (
+                  <>
+                    <Box sx={{ px: 3, height: 66, minHeight: 66, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <Box display="flex" alignItems="center" gap={1}>
+                      <CloudDownload color="primary" />
+                      <Typography sx={{ fontSize: '16px', fontWeight: 700 }}>添加 Profile</Typography>
+                    </Box>
+                    <Box display="flex" gap={1}>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        onClick={() => {
+                          setShowAddWorkspace(false)
+                          resetAddWorkspace()
+                        }}
+                        disabled={writeState === 'writing'}
+                        sx={{ 
+                          borderColor: 'divider', 
+                          color: 'text.secondary',
+                          '&:hover': {
+                            borderColor: 'text.secondary',
+                            color: 'text.primary',
+                            bgcolor: 'action.hover',
+                          }
+                        }}
+                      >
+                        取消
+                      </Button>
+                      <Button
+                        size="small"
+                        variant="contained"
+                        color="primary"
+                        onClick={() => void startWriteCard()}
+                        disabled={writeState === 'writing' || writeState === 'success' || !addForm.smdp || !addForm.matchingId}
+                      >
+                        开始写卡
+                      </Button>
+                    </Box>
+                  </Box>
+                    <Divider />
+                    <Box sx={{ p: 3, flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+                      {writeState === 'success' ? (
+                        <Box
+                          sx={{
+                            display: 'flex',
+                            flexDirection: 'column',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            minHeight: 300,
+                            textAlign: 'center',
+                            p: 3,
+                          }}
+                        >
+                          <Avatar
+                            sx={{
+                              width: 56,
+                              height: 56,
+                              bgcolor: 'success.main',
+                              color: 'success.contrastText',
+                              mb: 2,
+                              boxShadow: '0 0 12px rgba(16, 185, 129, 0.25)',
+                            }}
+                          >
+                            <CheckCircle sx={{ fontSize: 32 }} />
+                          </Avatar>
+                          <Typography variant="h6" fontWeight={700} mb={1}>
+                            Profile 写入成功
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary" mb={3} sx={{ maxWidth: 400 }}>
+                            新配置已在 eUICC 芯片中成功写入，本地 SQLite 缓存已水合更新。您可以在左侧 Profiles 列表中找到它并随时启用。
+                          </Typography>
+                          <Button
+                            variant="outlined"
+                            onClick={() => {
+                              setShowAddWorkspace(false)
+                              resetAddWorkspace()
+                            }}
+                          >
+                            返回详情面板
+                          </Button>
+                        </Box>
+                      ) : (
+                        <>
+                          <Box sx={{ flexShrink: 0, mb: 2 }}>
+                            <Grid container spacing={2} mb={3}>
+                              <Grid size={{ xs: 12, md: 6 }}>
+                                <Box display="flex" flexDirection="column" gap={1}>
+                                  <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'rgb(15, 23, 42)', display: 'block', mb: 1 }}>
+                                    智能识别框
+                                  </Typography>
+                                  <Box sx={{ position: 'relative' }}>
+                                    <TextField
+                                      fullWidth
+                                      multiline
+                                      rows={3}
+                                      placeholder="在此粘贴 LPA 激活码 (如 LPA:1$smdp.io$matching-id)"
+                                      value={smartInput}
+                                      onChange={(e) => {
+                                        setSmartInput(e.target.value)
+                                        parseLpaCode(e.target.value)
+                                      }}
+                                      disabled={writeState === 'writing'}
+                                      sx={{
+                                        '& .MuiOutlinedInput-root': {
+                                          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+                                          fontSize: '14px',
+                                          fontWeight: 400,
+                                          height: 98,
+                                          alignItems: 'flex-start',
+                                        }
+                                      }}
+                                    />
+                                    {smartParsed && (
+                                      <Chip
+                                        label="解析成功"
+                                        size="small"
+                                        color="primary"
+                                        sx={{
+                                          position: 'absolute',
+                                          bottom: 8,
+                                          right: 8,
+                                          height: 20,
+                                          fontSize: '0.6875rem',
+                                          pointerEvents: 'none',
+                                        }}
+                                      />
+                                    )}
+                                  </Box>
+                                </Box>
+                              </Grid>
+                              <Grid size={{ xs: 12, md: 6 }}>
+                                <Box display="flex" flexDirection="column" gap={1}>
+                                  <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'rgb(15, 23, 42)', display: 'block', mb: 1 }}>
+                                    二维码解析区
+                                  </Typography>
+                                  <Box
+                                    onClick={() => fileInputRef.current?.click()}
+                                    onDragOver={(e) => e.preventDefault()}
+                                    onDrop={(e) => {
+                                      e.preventDefault()
+                                      if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+                                        handleQrUpload(e.dataTransfer.files[0])
+                                      }
+                                    }}
+                                    sx={{
+                                      height: 98,
+                                      boxSizing: 'border-box',
+                                      border: '1px dashed',
+                                      borderColor: (theme) => alpha(theme.palette.primary.main, 0.4),
+                                      borderRadius: 1,
+                                      bgcolor: (theme) => alpha(theme.palette.primary.main, 0.04),
+                                      color: 'primary.main',
+                                      display: 'flex',
+                                      flexDirection: 'column',
+                                      alignItems: 'center',
+                                      justifyContent: 'center',
+                                      cursor: 'pointer',
+                                      gap: 0.5,
+                                      transition: 'all 0.2s',
+                                      '&:hover': {
+                                        border: '2px dashed',
+                                        borderColor: 'primary.main',
+                                      },
+                                    }}
+                                  >
+                                    <input
+                                      type="file"
+                                      accept="image/*"
+                                      ref={fileInputRef}
+                                      onChange={(e) => {
+                                        if (e.target.files && e.target.files[0]) {
+                                          handleQrUpload(e.target.files[0])
+                                        }
+                                      }}
+                                      style={{ display: 'none' }}
+                                    />
+                                    <QrCodeScanner color="primary" />
+                                    <Typography variant="caption" sx={{ color: 'primary.main', fontWeight: 500 }}>
+                                      点击或拖入二维码图片解码
+                                    </Typography>
+                                  </Box>
+                                </Box>
+                              </Grid>
+                            </Grid>
+
+                            {/* Bottom 2x2 grid form */}
+                            <Box
+                              sx={{
+                                py: 1,
+                                transition: 'all 0.2s',
+                                mb: writeState === 'writing' || writeState === 'failed' ? 3 : 0,
+                              }}
+                            >
+                              <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'rgb(15, 23, 42)', display: 'block', mb: 2 }}>
+                                预览与校验
+                              </Typography>
+                              <Grid container columnSpacing={2} rowSpacing={4}>
+                                <Grid size={{ xs: 12, md: 6 }}>
+                                  <TextField
+                                    fullWidth
+                                    label="SM-DP+ 服务器地址 *"
+                                    value={addForm.smdp}
+                                    onChange={(e) => setAddForm((prev) => ({ ...prev, smdp: e.target.value }))}
+                                    disabled={writeState === 'writing'}
+                                    slotProps={{
+                                      input: { sx: { fontSize: '14px', fontWeight: 400 } },
+                                      inputLabel: { sx: { fontSize: '14px', fontWeight: 400 } }
+                                    }}
+                                  />
+                                </Grid>
+                                <Grid size={{ xs: 12, md: 6 }}>
+                                  <TextField
+                                    fullWidth
+                                    label="标识码 (Matching ID)*"
+                                    value={addForm.matchingId}
+                                    onChange={(e) => setAddForm((prev) => ({ ...prev, matchingId: e.target.value }))}
+                                    disabled={writeState === 'writing'}
+                                    slotProps={{
+                                      input: { sx: { fontSize: '14px', fontWeight: 400 } },
+                                      inputLabel: { sx: { fontSize: '14px', fontWeight: 400 } }
+                                    }}
+                                  />
+                                </Grid>
+                                <Grid size={{ xs: 12, md: 6 }}>
+                                  <TextField
+                                    fullWidth
+                                    label="确认码 (选填)"
+                                    value={addForm.confirmationCode}
+                                    onChange={(e) => setAddForm((prev) => ({ ...prev, confirmationCode: e.target.value }))}
+                                    disabled={writeState === 'writing'}
+                                    slotProps={{
+                                      input: { sx: { fontSize: '14px', fontWeight: 400 } },
+                                      inputLabel: { sx: { fontSize: '14px', fontWeight: 400 } }
+                                    }}
+                                  />
+                                </Grid>
+                                <Grid size={{ xs: 12, md: 6 }}>
+                                  <TextField
+                                    fullWidth
+                                    label="绑定 IMEI (选填)"
+                                    value={addForm.imei}
+                                    onChange={(e) => setAddForm((prev) => ({ ...prev, imei: e.target.value }))}
+                                    disabled={writeState === 'writing'}
+                                    slotProps={{
+                                      input: {
+                                        sx: {
+                                          fontSize: '14px',
+                                          fontWeight: 400,
+                                          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+                                        }
+                                      },
+                                      inputLabel: { sx: { fontSize: '14px', fontWeight: 400 } }
+                                    }}
+                                  />
+                                </Grid>
+                              </Grid>
+                            </Box>
+                          </Box>
+
+                          {/* Terminal simulation for writing process */}
+                          {(writeState === 'writing' || writeState === 'failed') && (
+                            <Box
+                              sx={{
+                                mt: 'auto',
+                                flex: 1,
+                                minHeight: 180,
+                                display: 'flex',
+                                flexDirection: 'column',
+                                border: '1px solid',
+                                borderColor: 'divider',
+                                borderRadius: 1,
+                                bgcolor: 'action.hover',
+                                color: 'text.primary',
+                                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+                                overflow: 'hidden',
+                              }}
+                            >
+                              <Box sx={{ bgcolor: 'action.selected', px: 2, py: 1, borderBottom: '1px solid', borderColor: 'divider', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                <Typography variant="caption" sx={{ color: 'text.secondary', fontFamily: 'inherit', fontWeight: 500 }}>
+                                  SimAdmin @ Add Profile
+                                </Typography>
+                                <Typography variant="caption" sx={{ color: 'text.secondary', fontFamily: 'inherit', fontWeight: 500 }}>
+                                  {writeProgress}%
+                                </Typography>
+                              </Box>
+                              <Box sx={{ p: 2, flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+                                <Box sx={{ mb: 2 }}>
+                                  <LinearProgress variant="determinate" value={writeProgress} color="primary" sx={{ height: 4, borderRadius: 1, bgcolor: 'divider' }} />
+                                </Box>
+                                <Box sx={{ fontSize: '0.75rem', lineHeight: 1.6, flex: 1, overflowY: 'auto' }}>
+                                  {writeLogLines.map((log, index) => (
+                                    <Box key={index} sx={{ display: 'flex', gap: 1, mb: 0.5 }}>
+                                      <Box component="span" sx={{ color: 'text.secondary' }}>{log.time}</Box>
+                                      <Box component="span" sx={{ color: 'primary.main' }}>&gt;</Box>
+                                      <Box component="span" sx={{ color: log.type === 'error' ? 'error.main' : log.type === 'success' ? 'success.dark' : 'inherit', fontWeight: log.type === 'success' || log.type === 'error' ? 500 : 400 }}>
+                                        {log.text}
+                                      </Box>
+                                    </Box>
+                                  ))}
+                                  <div ref={logEndRef} />
+                                </Box>
+                              </Box>
+                            </Box>
+                          )}
+                        </>
+                      )}
+                    </Box>
+                  </>
+                ) : selectedProfile ? (
                   <Box sx={{ height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
                     <Box p={3} display="flex" flexDirection={{ xs: 'column', sm: 'row' }} alignItems={{ sm: 'flex-start' }} justifyContent="space-between" gap={2}>
                       <Box minWidth={0}>

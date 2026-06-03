@@ -162,6 +162,14 @@ pub struct EsimRenameRequest {
     pub name: String,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct EsimDownloadRequest {
+    pub smdp: String,
+    pub matching_id: String,
+    pub confirmation_code: Option<String>,
+    pub imei: Option<String>,
+}
+
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct ServingCell {
     pub tech: String,

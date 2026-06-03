@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 
 use crate::config::ConfigManager;
 use crate::models::{
-    EsimCommandResponse, EsimEuiccInfo, EsimLpacRepairRequest, EsimLpacRepairResponse,
+    EsimCommandResponse, EsimDownloadRequest, EsimEuiccInfo, EsimLpacRepairRequest, EsimLpacRepairResponse,
     EsimLpacStatusResponse, EsimProfile, EsimProfilesResponse, WorkMode, WorkModeResponse,
 };
 
@@ -266,6 +266,35 @@ impl EsimSupervisor {
             ESIM_LONG_TIMEOUT_SECS,
         )
         .await
+    }
+
+    pub async fn download_profile(
+        &self,
+        request: EsimDownloadRequest,
+    ) -> Result<EsimCommandResponse, EsimApiError> {
+        let mut args = vec![
+            "profile",
+            "download",
+            "-s",
+            request.smdp.as_str(),
+            "-m",
+            request.matching_id.as_str(),
+        ];
+
+        let cc = request.confirmation_code.as_deref().unwrap_or("").trim();
+        if !cc.is_empty() {
+            args.push("-c");
+            args.push(cc);
+        }
+
+        let imei = request.imei.as_deref().unwrap_or("").trim();
+        if !imei.is_empty() {
+            args.push("-i");
+            args.push(imei);
+        }
+
+        // download can take up to 120 seconds
+        self.call_lpac("download", &args, 120).await
     }
 }
 
@@ -856,11 +885,45 @@ async fn run_lpac_command(
         }));
     }
 
-    let value = serde_json::from_str::<Value>(&stdout).map_err(|err| {
-        EsimApiError::Command(format!(
-            "Invalid JSON from lpac {action}: {err}; stdout: {stdout}"
-        ))
-    })?;
+    // Since lpac stdout can contain multiple JSON objects separated by whitespace/newlines (e.g. progress updates followed by the final lpa object),
+    // we search from the end of the stdout to find the last valid JSON block that starts with {"type" or simply {.
+    let mut parsed_value = None;
+    let mut search_pos = stdout.len();
+    while let Some(pos) = stdout[..search_pos].rfind(r#"{"type"#) {
+        if let Ok(val) = serde_json::from_str::<Value>(&stdout[pos..]) {
+            parsed_value = Some(val);
+            break;
+        }
+        if pos == 0 {
+            break;
+        }
+        search_pos = pos;
+    }
+
+    if parsed_value.is_none() {
+        let mut search_pos = stdout.len();
+        while let Some(pos) = stdout[..search_pos].rfind('{') {
+            if let Ok(val) = serde_json::from_str::<Value>(&stdout[pos..]) {
+                parsed_value = Some(val);
+                break;
+            }
+            if pos == 0 {
+                break;
+            }
+            search_pos = pos;
+        }
+    }
+
+    let value = match parsed_value {
+        Some(val) => val,
+        None => {
+            serde_json::from_str::<Value>(&stdout).map_err(|err| {
+                EsimApiError::Command(format!(
+                    "Invalid JSON from lpac {action}: {err}; stdout: {stdout}"
+                ))
+            })?
+        }
+    };
 
     Ok(normalize_lpac_response(
         action,
@@ -1090,7 +1153,7 @@ fn normalize_profiles(response: EsimCommandResponse) -> EsimProfilesResponse {
     EsimProfilesResponse { profiles }
 }
 
-fn normalize_profile(value: &Value) -> EsimProfile {
+pub fn normalize_profile(value: &Value) -> EsimProfile {
     let null = Value::Null;
     let ppr = value.get("ppr").unwrap_or(&null);
     let operator = value

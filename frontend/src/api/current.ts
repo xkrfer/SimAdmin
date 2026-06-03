@@ -27,6 +27,7 @@ import type {
   DdnsSyncResponse,
   DeviceInfo,
   EsimCommandResponse,
+  EsimDownloadRequest,
   EsimEuiccInfo,
   EsimLpacRepairRequest,
   EsimLpacRepairResponse,
@@ -289,6 +290,14 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<EsimCommandResponse>>(`/esim/profiles/${encodeURIComponent(iccid)}`, {
       method: 'DELETE',
       timeoutMs: 60000,
+    })
+  }
+
+  async downloadEsimProfile(requestData: EsimDownloadRequest) {
+    return request<ApiResponse<EsimCommandResponse>>('/esim/profiles', {
+      method: 'POST',
+      body: JSON.stringify(requestData),
+      timeoutMs: 180000, // 3 minutes timeout
     })
   }
 
