@@ -21,10 +21,14 @@ fn main() {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
+    let repo = std::env::var("SIMADMIN_REPO").unwrap_or_else(|_| "xkrfer/SimAdmin".to_string());
+
     // Set compile-time environment variables
     println!("cargo:rustc-env=APP_VERSION={}", version);
     println!("cargo:rustc-env=GIT_BRANCH={}", branch);
     println!("cargo:rustc-env=GIT_COMMIT={}", commit);
+    println!("cargo:rustc-env=SIMADMIN_REPO={}", repo);
+    println!("cargo:rerun-if-env-changed=SIMADMIN_REPO");
 
     // Rebuild if VERSION file changes
     println!("cargo:rerun-if-changed=../VERSION");

@@ -27,8 +27,11 @@ const LPAC_PROBE_TIMEOUT_SECS: u64 = 3;
 const MAX_LPAC_DOWNLOAD_BYTES: usize = 25 * 1024 * 1024;
 const LPAC_OFFICIAL_RELEASE_BASE_URL: &str =
     "https://github.com/estkme-group/lpac/releases/latest/download";
-const LPAC_COMPAT_RELEASE_BASE_URL: &str =
-    "https://github.com/3899/SimAdmin/releases/download/lpac";
+const LPAC_COMPAT_RELEASE_BASE_URL: &str = concat!(
+    "https://github.com/",
+    env!("SIMADMIN_REPO"),
+    "/releases/download/lpac"
+);
 const LPAC_COMPAT_MANIFEST_NAME: &str = "lpac.json";
 const PRIVATE_LPAC_DIR: &str = "/opt/simadmin/lpac";
 const PRIVATE_LPAC_PATH: &str = "/opt/simadmin/lpac/lpac";
