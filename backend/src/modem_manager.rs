@@ -2213,7 +2213,7 @@ fn qmi_device_exists(_path: &str) -> bool {
 }
 
 #[cfg(unix)]
-fn find_qmi_device_path() -> Option<String> {
+pub fn find_qmi_device_path() -> Option<String> {
     let mut candidates = vec!["/dev/wwan0qmi0".to_string()];
     if let Ok(entries) = fs::read_dir("/dev") {
         let mut qmi_ports = Vec::new();
@@ -2236,7 +2236,29 @@ fn find_qmi_device_path() -> Option<String> {
 }
 
 #[cfg(not(unix))]
-fn find_qmi_device_path() -> Option<String> {
+pub fn find_qmi_device_path() -> Option<String> {
+    None
+}
+
+#[cfg(unix)]
+pub fn find_at_device_path() -> Option<String> {
+    let mut candidates = vec!["/dev/wwan0at0".to_string()];
+    if let Ok(entries) = fs::read_dir("/dev") {
+        let mut wwan_at_ports = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("wwan") && name.contains("at") {
+                wwan_at_ports.push(format!("/dev/{name}"));
+            }
+        }
+        wwan_at_ports.sort();
+        candidates.extend(wwan_at_ports);
+    }
+    candidates.into_iter().find(|path| qmi_device_exists(path))
+}
+
+#[cfg(not(unix))]
+pub fn find_at_device_path() -> Option<String> {
     None
 }
 

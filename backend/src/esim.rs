@@ -15,6 +15,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::config::ConfigManager;
+use crate::modem_manager::{find_at_device_path, find_qmi_device_path};
 use crate::models::{
     EsimCommandResponse, EsimDownloadRequest, EsimEuiccInfo, EsimLpacRepairRequest, EsimLpacRepairResponse,
     EsimLpacStatusResponse, EsimProfile, EsimProfilesResponse, WorkMode, WorkModeResponse,
@@ -964,11 +965,15 @@ fn resolve_lpac_path(lpac_path: &str) -> PathBuf {
 }
 
 fn configure_lpac_environment(command: &mut tokio::process::Command, command_path: &Path) {
+    let qmi_device =
+        find_qmi_device_path().unwrap_or_else(|| "/dev/wwan0qmi0".to_string());
+    let at_device = find_at_device_path().unwrap_or_else(|| "/dev/wwan0at0".to_string());
+
     set_env_default(command, "LPAC_APDU", "qmi");
     set_env_default(command, "LPAC_HTTP", "curl");
-    set_env_default(command, "LPAC_APDU_QMI_DEVICE", "/dev/wwan0qmi0");
+    set_env_default(command, "LPAC_APDU_QMI_DEVICE", &qmi_device);
     set_env_default(command, "LPAC_APDU_QMI_UIM_SLOT", "1");
-    set_env_default(command, "LPAC_APDU_AT_DEVICE", "/dev/wwan0at0");
+    set_env_default(command, "LPAC_APDU_AT_DEVICE", &at_device);
 
     if let Some(parent) = command_path
         .parent()
