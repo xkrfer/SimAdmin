@@ -179,12 +179,190 @@ configure_networkmanager_modem_unmanaged() {
   nm_conf="/etc/NetworkManager/conf.d/99-simadmin-unmanaged-modem.conf"
   {
     printf '%s\n' '[keyfile]'
-    printf '%s\n' 'unmanaged-devices=interface-name:wwan*'
+    printf '%s\n' 'unmanaged-devices=interface-name:wwan*,interface-name:wws*'
   } > "$nm_conf"
 
   if systemctl is-active --quiet NetworkManager.service; then
     systemctl restart NetworkManager.service || true
   fi
+}
+
+MM_POLICY_CONF="/etc/ModemManager/conf.d/99-simadmin-allow-all.conf"
+QUECTEL_UDEV_RULES="/etc/udev/rules.d/99-simadmin-quectel-mm.rules"
+
+udev_device_missing_mm_tags() {
+  dev="$1"
+  [ -e "$dev" ] || return 1
+  udevadm info "$dev" 2>/dev/null | grep -q 'ID_MM_CANDIDATE=1' && return 1
+  return 0
+}
+
+has_cellular_modem_hardware() {
+  if command -v lsusb >/dev/null 2>&1; then
+    if lsusb 2>/dev/null | grep -qiE 'quectel|modem|2c7c:|1bc7:|1199:|05c6:|1e0e:'; then
+      return 0
+    fi
+  fi
+
+  if [ -e /dev/cdc-wdm0 ]; then
+    return 0
+  fi
+
+  if ls /dev/ttyUSB* >/dev/null 2>&1; then
+    return 0
+  fi
+
+  return 1
+}
+
+has_quectel_modem() {
+  command -v lsusb >/dev/null 2>&1 || return 1
+  lsusb 2>/dev/null | grep -q '2c7c:'
+}
+
+needs_quectel_udev_fix() {
+  has_quectel_modem || return 1
+
+  if [ -e /dev/cdc-wdm0 ] && udev_device_missing_mm_tags /dev/cdc-wdm0; then
+    return 0
+  fi
+
+  for dev in /dev/ttyUSB0 /dev/ttyUSB1 /dev/ttyUSB2 /dev/ttyUSB3; do
+    if [ -e "$dev" ] && udev_device_missing_mm_tags "$dev"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+modemmanager_sees_modem() {
+  command -v mmcli >/dev/null 2>&1 || return 1
+  mmcli -L 2>/dev/null | grep -q '/org/freedesktop/ModemManager1/Modem/'
+}
+
+ensure_modemmanager_ready() {
+  if ! command -v mmcli >/dev/null 2>&1; then
+    echo "    installing ModemManager packages"
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        modemmanager libqmi-utils libmbim-utils usb-modeswitch
+    else
+      echo "warning: mmcli not found and apt-get unavailable; install modemmanager manually" >&2
+      return 0
+    fi
+  fi
+
+  if systemctl list-unit-files ModemManager.service >/dev/null 2>&1; then
+    systemctl enable ModemManager.service >/dev/null 2>&1 || true
+    if ! systemctl is-active --quiet ModemManager.service; then
+      echo "    starting ModemManager"
+      systemctl start ModemManager.service || true
+      MODEM_ENV_NEEDS_MM_RESTART=0
+      sleep 3
+    fi
+  fi
+}
+
+ensure_modemmanager_filter_policy() {
+  mkdir -p /etc/ModemManager/conf.d
+  if [ -f "$MM_POLICY_CONF" ] && grep -q 'filter-policy=none' "$MM_POLICY_CONF" 2>/dev/null; then
+    return 0
+  fi
+
+  echo "    configuring ModemManager filter-policy=none"
+  cat > "$MM_POLICY_CONF" <<'EOF'
+# SimAdmin: avoid strict filtering blocking USB modems (e.g. Quectel in VMs)
+[Policy]
+filter-policy=none
+EOF
+  MODEM_ENV_NEEDS_MM_RESTART=1
+}
+
+ensure_quectel_udev_tags() {
+  if ! needs_quectel_udev_fix; then
+    return 0
+  fi
+
+  echo "    applying Quectel ModemManager udev tags (missing ID_MM_* workaround)"
+  cat > "$QUECTEL_UDEV_RULES" <<'EOF'
+# SimAdmin: Quectel USB modems - force ModemManager port tags when official
+# 77-mm-quectel-port-types.rules does not set ENV{.MM_USBIFNUM} (common in VMs)
+SUBSYSTEM=="usbmisc", KERNEL=="cdc-wdm*", ATTRS{idVendor}=="2c7c", \
+  TAG+="uaccess", ENV{ID_MM_CANDIDATE}="1", ENV{ID_MM_PORT_TYPE}="qmi"
+
+SUBSYSTEM=="tty", KERNEL=="ttyUSB*", ATTRS{idVendor}=="2c7c", \
+  ENV{ID_MM_CANDIDATE}="1", ENV{ID_MM_PORT_TYPE}="at"
+EOF
+  MODEM_ENV_NEEDS_UDEV_RELOAD=1
+}
+
+restart_modemmanager_if_needed() {
+  if truthy "${MODEM_ENV_NEEDS_UDEV_RELOAD:-0}"; then
+    echo "    reloading udev rules"
+    udevadm control --reload-rules
+    udevadm trigger
+    sleep 2
+    MODEM_ENV_NEEDS_MM_RESTART=1
+  fi
+
+  if ! truthy "${MODEM_ENV_NEEDS_MM_RESTART:-0}"; then
+    return 0
+  fi
+
+  if ! systemctl list-unit-files ModemManager.service >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "    restarting ModemManager"
+  systemctl stop ModemManager.service >/dev/null 2>&1 || true
+  rm -rf /var/lib/ModemManager/* 2>/dev/null || true
+  systemctl start ModemManager.service >/dev/null 2>&1 || true
+  sleep 8
+}
+
+verify_modemmanager_modem() {
+  if ! command -v mmcli >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if modemmanager_sees_modem; then
+    mmcli -L 2>/dev/null | sed -n '/Modem/s/^[[:space:]]*/    /p' | head -n 1
+    return 0
+  fi
+
+  echo "warning: modem hardware detected but ModemManager reports no modems (mmcli -L)" >&2
+  echo "warning: check: journalctl -u ModemManager -n 50 --no-pager" >&2
+}
+
+prepare_modem_environment() {
+  if truthy "${SIMADMIN_SKIP_MODEM_ENV:-0}"; then
+    echo "==> skipping modem environment setup (SIMADMIN_SKIP_MODEM_ENV=1)"
+    return 0
+  fi
+
+  echo "==> checking cellular modem environment"
+  MODEM_ENV_NEEDS_UDEV_RELOAD=0
+  MODEM_ENV_NEEDS_MM_RESTART=0
+
+  if ! has_cellular_modem_hardware; then
+    echo "    no cellular modem hardware detected, skipping"
+    return 0
+  fi
+
+  ensure_modemmanager_ready
+  ensure_modemmanager_filter_policy
+  ensure_quectel_udev_tags
+  restart_modemmanager_if_needed
+
+  if modemmanager_sees_modem; then
+    echo "    ModemManager modem ready"
+    verify_modemmanager_modem
+    return 0
+  fi
+
+  verify_modemmanager_modem
 }
 
 normalize_lpac_arch() {
@@ -787,6 +965,7 @@ main() {
   install_modem_recovery_service
 
   configure_networkmanager_modem_unmanaged
+  prepare_modem_environment
 
   echo "==> starting service"
   systemctl restart "${SERVICE_NAME}.service"
