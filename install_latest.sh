@@ -2,23 +2,21 @@
 
 set -eu
 
-REPO="${REPO:-3899/SimAdmin}"
+REPO="${REPO:-xkrfer/SimAdmin}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/simadmin}"
 SERVICE_NAME="${SERVICE_NAME:-simadmin}"
 VERSION="${VERSION:-latest}"
-GH_PROXY="${GH_PROXY:-https://gh-proxy.com/}"
-GH_PROXY_FALLBACKS="${GH_PROXY_FALLBACKS:-https://ghproxy.net/ https://githubproxy.cc/}"
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/${REPO}}"
 SERVICE_URL="${SERVICE_URL:-${RAW_BASE}/main/scripts/simadmin.service}"
 MODEM_RECOVERY_SCRIPT_URL="${MODEM_RECOVERY_SCRIPT_URL:-${RAW_BASE}/main/scripts/simadmin-modem-recovery.sh}"
 MODEM_RECOVERY_SERVICE_URL="${MODEM_RECOVERY_SERVICE_URL:-${RAW_BASE}/main/scripts/simadmin-modem-recovery.service}"
 ASSET_URL="${ASSET_URL:-}"
-ASSET_NAME="${ASSET_NAME:-simadmin.tar.gz}"
+ASSET_NAME="${ASSET_NAME:-}"
 SIMADMIN_INSTALL_LPAC="${SIMADMIN_INSTALL_LPAC:-1}"
 LPAC_REPO="${LPAC_REPO:-estkme-group/lpac}"
 LPAC_RELEASE_BASE_URL="${LPAC_RELEASE_BASE_URL:-https://github.com/${LPAC_REPO}/releases/latest/download}"
 LPAC_LATEST_RELEASE_URL="${LPAC_LATEST_RELEASE_URL:-https://github.com/${LPAC_REPO}/releases/latest}"
-LPAC_COMPAT_RELEASE_BASE_URL="${LPAC_COMPAT_RELEASE_BASE_URL:-https://github.com/3899/SimAdmin/releases/download/lpac}"
+LPAC_COMPAT_RELEASE_BASE_URL="${LPAC_COMPAT_RELEASE_BASE_URL:-https://github.com/${REPO}/releases/download/lpac}"
 LPAC_COMPAT_MANIFEST_NAME="${LPAC_COMPAT_MANIFEST_NAME:-lpac.json}"
 LPAC_TARGET_ARCH="${LPAC_TARGET_ARCH:-}"
 LPAC_TARGET_VERSION="${LPAC_TARGET_VERSION:-}"
@@ -51,50 +49,14 @@ truthy() {
 download_with_proxies() {
   src_url="$1"
   dst_path="$2"
-
-  case "$src_url" in
-    https://github.com/*|https://raw.githubusercontent.com/*|https://objects.githubusercontent.com/*|https://api.github.com/*)
-      for proxy in $GH_PROXY $GH_PROXY_FALLBACKS ""; do
-        url="${proxy}${src_url}"
-        echo "    ${url}"
-        if curl -fsSL "$url" -o "$dst_path"; then
-          return 0
-        fi
-        echo "    download failed, trying next mirror" >&2
-      done
-      ;;
-    *)
-      echo "    ${src_url}"
-      curl -fsSL "$src_url" -o "$dst_path"
-      return $?
-      ;;
-  esac
-
-  return 1
+  echo "    ${src_url}"
+  curl -fsSL "$src_url" -o "$dst_path"
 }
 
 read_with_proxies() {
   src_url="$1"
-
-  case "$src_url" in
-    https://github.com/*|https://raw.githubusercontent.com/*|https://objects.githubusercontent.com/*|https://api.github.com/*)
-      for proxy in $GH_PROXY $GH_PROXY_FALLBACKS ""; do
-        url="${proxy}${src_url}"
-        echo "    ${url}" >&2
-        if curl -fsSL "$url"; then
-          return 0
-        fi
-        echo "    download failed, trying next mirror" >&2
-      done
-      ;;
-    *)
-      echo "    ${src_url}" >&2
-      curl -fsSL "$src_url"
-      return $?
-      ;;
-  esac
-
-  return 1
+  echo "    ${src_url}" >&2
+  curl -fsSL "$src_url"
 }
 
 version_to_tag() {
@@ -106,7 +68,27 @@ version_to_tag() {
 
 asset_url_from_tag() {
   tag="$1"
-  printf 'https://github.com/%s/releases/download/%s/simadmin.tar.gz\n' "$REPO" "$tag"
+  asset_name="$(resolve_asset_name)"
+  printf 'https://github.com/%s/releases/download/%s/%s\n' "$REPO" "$tag" "$asset_name"
+}
+
+resolve_asset_name() {
+  if [ -n "$ASSET_NAME" ]; then
+    printf '%s\n' "$ASSET_NAME"
+    return 0
+  fi
+
+  case "$(uname -m)" in
+    aarch64|arm64)
+      printf '%s\n' "simadmin.tar.gz"
+      ;;
+    x86_64|amd64)
+      printf '%s\n' "simadmin-x86_64.tar.gz"
+      ;;
+    *)
+      printf '%s\n' "simadmin.tar.gz"
+      ;;
+  esac
 }
 
 repo_version() {
@@ -124,7 +106,8 @@ resolve_asset_url() {
   fi
 
   if [ "$VERSION" = "latest" ]; then
-    printf 'https://github.com/%s/releases/latest/download/%s\n' "$REPO" "$ASSET_NAME"
+    asset_name="$(resolve_asset_name)"
+    printf 'https://github.com/%s/releases/latest/download/%s\n' "$REPO" "$asset_name"
   else
     asset_url_from_tag "$(version_to_tag "$VERSION")"
   fi
@@ -299,6 +282,8 @@ resolve_lpac_asset_name() {
       glibc_version="$(detect_glibc_version)"
       if [ "$arch" = "aarch64" ] && version_le "2.31" "$glibc_version"; then
         printf 'lpac-linux-aarch64-glibc2.31.zip\n'
+      elif [ "$arch" = "x86_64" ] && version_le "2.31" "$glibc_version"; then
+        printf 'lpac-linux-x86_64-glibc2.31.zip\n'
       else
         printf 'lpac-linux-%s.zip\n' "$arch"
       fi
@@ -327,7 +312,10 @@ resolve_lpac_asset_url() {
 
   arch="$(detect_lpac_arch)" || return 1
   asset_name="$(resolve_lpac_asset_name "$arch")" || return 1
-  if [ "$LPAC_ASSET_FLAVOR" = "compat" ] && [ "$asset_name" = "lpac-linux-aarch64-glibc2.31.zip" ]; then
+  if [ "$LPAC_ASSET_FLAVOR" = "compat" ] && {
+    [ "$asset_name" = "lpac-linux-aarch64-glibc2.31.zip" ] ||
+    [ "$asset_name" = "lpac-linux-x86_64-glibc2.31.zip" ]
+  }; then
     printf '%s/%s\n' "$LPAC_COMPAT_RELEASE_BASE_URL" "$asset_name"
     return 0
   fi
@@ -510,7 +498,7 @@ lpac_asset_name_from_url() {
 lpac_url_source() {
   url="$1"
   case "$url" in
-    "$LPAC_COMPAT_RELEASE_BASE_URL"/*|https://github.com/3899/SimAdmin/releases/download/lpac/*)
+    "$LPAC_COMPAT_RELEASE_BASE_URL"/*|https://github.com/"$REPO"/releases/download/lpac/*)
       printf '%s\n' "compat"
       ;;
     "$LPAC_RELEASE_BASE_URL"/*|https://github.com/"$LPAC_REPO"/releases/latest/download/*|https://github.com/"$LPAC_REPO"/releases/download/*)

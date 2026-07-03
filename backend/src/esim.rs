@@ -395,8 +395,12 @@ fn find_version_token(text: &str) -> Option<String> {
 }
 
 fn recommended_lpac_asset_name(arch: &str, glibc_version: &str) -> String {
-    if arch == "aarch64" && version_le("2.31", glibc_version).unwrap_or(false) {
-        return "lpac-linux-aarch64-glibc2.31.zip".to_string();
+    if version_le("2.31", glibc_version).unwrap_or(false) {
+        match arch {
+            "aarch64" => return "lpac-linux-aarch64-glibc2.31.zip".to_string(),
+            "x86_64" => return "lpac-linux-x86_64-glibc2.31.zip".to_string(),
+            _ => {}
+        }
     }
     format!("lpac-linux-{arch}.zip")
 }

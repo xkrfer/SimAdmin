@@ -146,7 +146,21 @@ pub fn is_supported_ota_asset(name: &str) -> bool {
     lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".zip")
 }
 
+fn preferred_ota_asset_name() -> Option<&'static str> {
+    match expected_ota_arch()? {
+        "aarch64-unknown-linux-musl" => Some("simadmin.tar.gz"),
+        "x86_64-unknown-linux-musl" => Some("simadmin-x86_64.tar.gz"),
+        _ => None,
+    }
+}
+
 pub fn supported_release_asset(release: &OtaLatestReleaseResponse) -> Option<&OtaReleaseAsset> {
+    if let Some(name) = preferred_ota_asset_name() {
+        if let Some(asset) = release.assets.iter().find(|asset| asset.name == name) {
+            return Some(asset);
+        }
+    }
+
     release
         .assets
         .iter()
@@ -405,6 +419,15 @@ pub fn handle_ota_upload(data: &[u8]) -> Result<OtaUploadResponse, String> {
     Ok(OtaUploadResponse { meta, validation })
 }
 
+/// 当前运行平台期望的 OTA 架构标识
+fn expected_ota_arch() -> Option<&'static str> {
+    match std::env::consts::ARCH {
+        "aarch64" => Some("aarch64-unknown-linux-musl"),
+        "x86_64" => Some("x86_64-unknown-linux-musl"),
+        _ => None,
+    }
+}
+
 /// 验证 OTA 包
 fn validate_ota_package(meta: &OtaMeta) -> Result<OtaValidation, String> {
     let binary_path = format!("{}/simadmin", OTA_STAGING_DIR);
@@ -440,8 +463,11 @@ fn validate_ota_package(meta: &OtaMeta) -> Result<OtaValidation, String> {
     // 前端目录存在即可（MD5 跨平台难以保持一致）
     let frontend_md5_match = true; // 跳过前端 MD5 验证
 
-    // 检查架构（只接受 musl）
-    let arch_match = meta.arch == "aarch64-unknown-linux-musl";
+    // 检查架构（只接受与当前平台匹配的 musl 产物）
+    let expected_arch = expected_ota_arch();
+    let arch_match = expected_arch
+        .map(|expected| meta.arch == expected)
+        .unwrap_or(false);
 
     // 比较版本
     let is_newer = compare_versions(&meta.version, CURRENT_VERSION);
@@ -460,7 +486,8 @@ fn validate_ota_package(meta: &OtaMeta) -> Result<OtaValidation, String> {
         }
         if !arch_match {
             errors.push(format!(
-                "Arch mismatch: expected=aarch64-unknown-linux-musl, actual={}",
+                "Arch mismatch: expected={}, actual={}",
+                expected_arch.unwrap_or("unsupported"),
                 meta.arch
             ));
         }
