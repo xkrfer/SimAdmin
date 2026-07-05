@@ -91,6 +91,8 @@ pub struct EsimEuiccInfo {
     pub memory_available_kb: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_total_customizable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
     #[serde(default)]
     pub raw: Value,
 }
@@ -123,6 +125,8 @@ pub struct EsimProfile {
     pub disable_allowed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delete_allowed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
     #[serde(default)]
     pub raw: Value,
 }
@@ -429,13 +433,13 @@ pub struct NetworkSpeed {
     pub total_tx_bytes: u64,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Clone)]
 pub struct NetworkSpeedResponse {
     pub interfaces: Vec<NetworkSpeed>,
     pub interval_seconds: f64,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Clone)]
 pub struct MemoryInfo {
     pub total_bytes: u64,
     pub available_bytes: u64,
@@ -445,14 +449,14 @@ pub struct MemoryInfo {
     pub buffers_bytes: u64,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Clone)]
 pub struct UptimeInfo {
     pub uptime_seconds: u64,
     pub idle_seconds: u64,
     pub uptime_formatted: String,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Clone)]
 pub struct SystemInfo {
     pub sysname: String,
     pub nodename: String,
@@ -464,7 +468,7 @@ pub struct SystemInfo {
     pub full_info: String,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Clone)]
 pub struct SystemStatsResponse {
     pub network_speed: NetworkSpeedResponse,
     pub memory: MemoryInfo,
@@ -475,7 +479,7 @@ pub struct SystemStatsResponse {
     pub temperature: Vec<ThermalZone>,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Clone)]
 pub struct DiskInfo {
     pub mount_point: String,
     pub fs_type: String,
@@ -1005,7 +1009,6 @@ pub struct OtaLatestReleaseResponse {
 pub struct VersionUpdateEvent {
     pub asset_name: String,
     pub version: String,
-    pub commit: String,
     pub build_time: String,
     pub release_url: String,
     pub timestamp: String,

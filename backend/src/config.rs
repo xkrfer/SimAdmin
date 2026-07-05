@@ -200,6 +200,46 @@ pub struct TelegramConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerChan3Config {
+    #[serde(flatten)]
+    pub common: MessageChannelConfig,
+    #[serde(default)]
+    pub send_key: String,
+    #[serde(default)]
+    pub uid: String,
+    #[serde(default)]
+    pub channel: String,
+    #[serde(default)]
+    pub openid: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailConfig {
+    #[serde(flatten)]
+    pub common: MessageChannelConfig,
+    #[serde(default)]
+    pub smtp_host: String,
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    #[serde(default = "default_smtp_security")]
+    pub smtp_security: String,
+    #[serde(default, alias = "allow_insecure_connections")]
+    pub allow_insecure_tls: bool,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub sender_address: String,
+    #[serde(default)]
+    pub sender_name: String,
+    #[serde(default, alias = "receiver_address")]
+    pub receiver_addresses: String,
+    #[serde(default = "default_email_message_format")]
+    pub message_format: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LegacyNotificationConfig {
     #[serde(default)]
     pub webhook: WebhookConfig,
@@ -219,6 +259,10 @@ pub struct LegacyNotificationConfig {
     pub feishu_robot: FeishuRobotConfig,
     #[serde(default)]
     pub telegram: TelegramConfig,
+    #[serde(default)]
+    pub serverchan3: ServerChan3Config,
+    #[serde(default)]
+    pub email: EmailConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,6 +278,9 @@ pub enum NotificationChannel {
     DingtalkApp,
     FeishuRobot,
     Telegram,
+    Email,
+    #[serde(rename = "serverchan3", alias = "server_chan3")]
+    ServerChan3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,6 +447,8 @@ pub struct NotificationRule {
     pub channel_ids: Vec<String>,
     #[serde(default)]
     pub event_codes: Vec<String>,
+    #[serde(default)]
+    pub title_template: String,
     #[serde(default)]
     pub template: String,
     #[serde(default)]
@@ -655,7 +704,7 @@ fn default_update_template() -> String {
     r#"{
   "msg_type": "text",
   "content": {
-    "text": "🚀 SimAdmin 发现新版本\n固件包: {{asset_name}}\n版本号: {{version}}\nCommit: {{commit}}\n时间: {{time}}\n来源: {{own_number}}\n\n请前往 OTA 在线更新模块检测版本，一键下载并升级。"
+    "text": "🚀 SimAdmin 发现新版本\n固件包: {{asset_name}}\n版本号: {{version}}\n时间: {{time}}\n来源: {{own_number}}\n\n请前往 OTA 在线更新模块检测版本，一键下载并升级。"
   }
 }"#
     .to_string()
@@ -675,7 +724,7 @@ fn default_plain_ddns_template() -> String {
 }
 
 fn default_plain_update_template() -> String {
-    "🚀 SimAdmin 发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\nCommit: {{Commit}}\n时间: {{时间}}\n来源: {{本机号码}}\n\n请前往 OTA 在线更新模块检测版本，一键下载并升级。".to_string()
+    "🚀 SimAdmin 发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\n时间: {{时间}}\n来源: {{本机号码}}\n\n请前往 OTA 在线更新模块检测版本，一键下载并升级。".to_string()
 }
 
 fn default_sms_title_template() -> String {
@@ -696,6 +745,18 @@ fn default_wecom_to_user() -> String {
 
 fn default_dingtalk_msg_key() -> String {
     "sampleText".to_string()
+}
+
+fn default_smtp_port() -> u16 {
+    465
+}
+
+fn default_smtp_security() -> String {
+    "implicit_tls".to_string()
+}
+
+fn default_email_message_format() -> String {
+    "plain".to_string()
 }
 
 impl Default for WebhookConfig {
@@ -841,6 +902,36 @@ impl Default for TelegramConfig {
     }
 }
 
+impl Default for ServerChan3Config {
+    fn default() -> Self {
+        Self {
+            common: MessageChannelConfig::default(),
+            send_key: String::new(),
+            uid: String::new(),
+            channel: String::new(),
+            openid: String::new(),
+        }
+    }
+}
+
+impl Default for EmailConfig {
+    fn default() -> Self {
+        Self {
+            common: MessageChannelConfig::default(),
+            smtp_host: String::new(),
+            smtp_port: default_smtp_port(),
+            smtp_security: default_smtp_security(),
+            allow_insecure_tls: false,
+            username: String::new(),
+            password: String::new(),
+            sender_address: String::new(),
+            sender_name: String::new(),
+            receiver_addresses: String::new(),
+            message_format: default_email_message_format(),
+        }
+    }
+}
+
 impl Default for LegacyNotificationConfig {
     fn default() -> Self {
         Self {
@@ -853,6 +944,8 @@ impl Default for LegacyNotificationConfig {
             dingtalk_app: DingtalkAppConfig::default(),
             feishu_robot: FeishuRobotConfig::default(),
             telegram: TelegramConfig::default(),
+            serverchan3: ServerChan3Config::default(),
+            email: EmailConfig::default(),
         }
     }
 }
@@ -947,6 +1040,8 @@ fn channel_label(channel: NotificationChannel) -> &'static str {
         NotificationChannel::DingtalkApp => "钉钉企业内机器人",
         NotificationChannel::FeishuRobot => "飞书机器人",
         NotificationChannel::Telegram => "Telegram 机器人",
+        NotificationChannel::Email => "Email",
+        NotificationChannel::ServerChan3 => "Server酱3",
     }
 }
 
@@ -1060,6 +1155,27 @@ fn legacy_channel_migrations(legacy: &LegacyNotificationConfig) -> Vec<LegacyCha
             || !legacy.telegram.bot_token.trim().is_empty()
             || !legacy.telegram.chat_id.trim().is_empty(),
     );
+    push_message_channel_migration(
+        &mut channels,
+        NotificationChannel::ServerChan3,
+        "serverchan3-1",
+        &legacy.serverchan3.common,
+        &legacy.serverchan3,
+        legacy.serverchan3.common.enabled
+            || !legacy.serverchan3.send_key.trim().is_empty()
+            || !legacy.serverchan3.uid.trim().is_empty(),
+    );
+    push_message_channel_migration(
+        &mut channels,
+        NotificationChannel::Email,
+        "email-1",
+        &legacy.email.common,
+        &legacy.email,
+        legacy.email.common.enabled
+            || !legacy.email.smtp_host.trim().is_empty()
+            || !legacy.email.sender_address.trim().is_empty()
+            || !legacy.email.receiver_addresses.trim().is_empty(),
+    );
 
     channels
 }
@@ -1138,6 +1254,7 @@ fn push_legacy_rule(
             .map(|channel| channel.id.clone())
             .collect(),
         event_codes: Vec::new(),
+        title_template: default_rule_title_template(event_type),
         template,
         quiet_hours: Vec::new(),
         ddns_failure_threshold: default_ddns_failure_threshold(),
@@ -1183,7 +1300,7 @@ pub fn default_rule_template(event_type: NotificationEventType) -> String {
             "DDNS 通知\n域名: {{域名}}\nIP 类型: {{IP类型}}\n新 IP: {{新IP}}\n旧 IP: {{旧IP}}\n服务商: {{服务商}}\n记录类型: {{记录类型}}\n状态: {{状态}}\n消息: {{消息}}\n更新时间: {{更新时间}}".to_string()
         }
         NotificationEventType::VersionUpdate => {
-            "🚀 SimAdmin 发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\nCommit: {{Commit}}\n构建时间: {{构建时间}}\nMD5: {{MD5}}\n来源: {{本机号码}}".to_string()
+            "🚀 SimAdmin 发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\n时间: {{时间}}\n来源: {{本机号码}}".to_string()
         }
         NotificationEventType::SystemEvent => {
             "系统事件通知\n分类: {{分类}}\n事件: {{事件}}\n等级: {{等级}}\n状态: {{状态}}\n对象: {{对象}}\n消息: {{消息}}\n时间: {{时间}}".to_string()
@@ -1194,6 +1311,17 @@ pub fn default_rule_template(event_type: NotificationEventType) -> String {
         NotificationEventType::Automation => {
             "🤖 自动化事件通知\n任务名称: {{任务名称}}\n任务类型: {{任务类型}}\n执行状态: {{任务状态}}\n详情: {{任务详情}}\n时间: {{触发时间}}\n来源: {{本机号码}}".to_string()
         }
+    }
+}
+
+pub fn default_rule_title_template(event_type: NotificationEventType) -> String {
+    match event_type {
+        NotificationEventType::Sms => "{{发送方号码}}：验证码{{验证码}}".to_string(),
+        NotificationEventType::Ddns => "DDNS通知：{{本机号码}}".to_string(),
+        NotificationEventType::VersionUpdate => "版本更新通知：{{本机号码}}".to_string(),
+        NotificationEventType::SystemEvent => "{{分类}}事件：{{本机号码}}".to_string(),
+        NotificationEventType::DeviceStatus => "设备状态：{{本机号码}}".to_string(),
+        NotificationEventType::Automation => "{{任务类型}}：{{本机号码}}".to_string(),
     }
 }
 
@@ -1330,6 +1458,37 @@ mod tests {
     }
 
     #[test]
+    fn notification_channel_accepts_email_and_serverchan3_keys() {
+        assert!(matches!(
+            serde_json::from_str::<NotificationChannel>(r#""email""#).unwrap(),
+            NotificationChannel::Email
+        ));
+        assert!(matches!(
+            serde_json::from_str::<NotificationChannel>(r#""serverchan3""#).unwrap(),
+            NotificationChannel::ServerChan3
+        ));
+        assert_eq!(
+            serde_json::to_string(&NotificationChannel::Email).unwrap(),
+            r#""email""#
+        );
+        assert_eq!(
+            serde_json::to_string(&NotificationChannel::ServerChan3).unwrap(),
+            r#""serverchan3""#
+        );
+    }
+
+    #[test]
+    fn email_config_accepts_legacy_receiver_address() {
+        let config: EmailConfig = serde_json::from_str(
+            r#"{"smtp_host":"smtp.example.com","receiver_address":"admin@example.com"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.smtp_security, "implicit_tls");
+        assert_eq!(config.receiver_addresses, "admin@example.com");
+    }
+
+    #[test]
     fn legacy_notification_config_migrates_channels_and_rules() {
         let mut legacy = LegacyNotificationConfig::default();
         legacy.webhook.enabled = true;
@@ -1361,6 +1520,35 @@ mod tests {
             .rules
             .iter()
             .any(|rule| rule.event_type == NotificationEventType::VersionUpdate));
+    }
+
+    #[test]
+    fn update_template_migration_removes_obsolete_commit_and_md5_lines() {
+        let mut config = AppConfig::default();
+        config.notifications.rules.push(NotificationRule {
+            id: "rule-update".to_string(),
+            event_type: NotificationEventType::VersionUpdate,
+            name: "版本更新".to_string(),
+            enabled: true,
+            matcher: RuleMatcher::default(),
+            channel_ids: Vec::new(),
+            event_codes: Vec::new(),
+            title_template: String::new(),
+            template: "版本号: {{版本号}}\nCommit: {{Commit}}\n构建时间: {{构建时间}}\nMD5: {{MD5}}\n来源: {{本机号码}}".to_string(),
+            quiet_hours: Vec::new(),
+            ddns_failure_threshold: 1,
+            device_status_items: default_device_status_items(),
+            device_status_schedule: DeviceStatusSchedule::default(),
+            device_status_sms_period: "last_24h".to_string(),
+        });
+
+        assert!(migrate_update_templates(&mut config));
+
+        let template = &config.notifications.rules[0].template;
+        assert_eq!(
+            template,
+            "版本号: {{版本号}}\n时间: {{时间}}\n来源: {{本机号码}}"
+        );
     }
 }
 
@@ -1546,7 +1734,7 @@ fn migrate_legacy_webhook_config(config: &mut AppConfig) {
         .unwrap_or_else(WebhookConfig::default);
 }
 
-fn migrate_template_string(template: &mut String) -> bool {
+fn migrate_update_template_string(template: &mut String) -> bool {
     let mut changed = false;
     let md5_patterns = [
         "OTA包 MD5: {{md5}}",
@@ -1564,8 +1752,20 @@ fn migrate_template_string(template: &mut String) -> bool {
         "{{binary_md5}}",
         "{{frontend_md5}}",
     ];
+    let commit_patterns = [
+        "Commit: {{commit}}",
+        "Commit: {{Commit}}",
+        "commit: {{commit}}",
+        "commit: {{Commit}}",
+        "提交: {{commit}}",
+        "提交: {{Commit}}",
+        "发布目标: {{target_commitish}}",
+        "{{commit}}",
+        "{{Commit}}",
+        "{{target_commitish}}",
+    ];
 
-    for pattern in md5_patterns {
+    for pattern in md5_patterns.into_iter().chain(commit_patterns) {
         // Try replacing with leading newline (escaped JSON or real)
         let with_escaped_newline = format!("\\n{}", pattern);
         if template.contains(&with_escaped_newline) {
@@ -1613,18 +1813,18 @@ fn migrate_template_string(template: &mut String) -> bool {
     changed
 }
 
-fn migrate_templates_to_remove_md5(config: &mut AppConfig) -> bool {
+fn migrate_update_templates(config: &mut AppConfig) -> bool {
     let mut changed = false;
 
     // 1. Webhook template
-    if migrate_template_string(&mut config.webhook.update_template) {
+    if migrate_update_template_string(&mut config.webhook.update_template) {
         changed = true;
     }
 
     // 2. Notification rules templates
     for rule in &mut config.notifications.rules {
         if rule.event_type == NotificationEventType::VersionUpdate {
-            if migrate_template_string(&mut rule.template) {
+            if migrate_update_template_string(&mut rule.template) {
                 changed = true;
             }
         }
@@ -1636,13 +1836,13 @@ fn migrate_templates_to_remove_md5(config: &mut AppConfig) -> bool {
             // E.g. BarkConfig, PushPlusConfig, WecomAppConfig etc have nested "common"
             if let Some(common) = obj.get_mut("common").and_then(|v| v.as_object_mut()) {
                 if let Some(serde_json::Value::String(tpl)) = common.get_mut("update_template") {
-                    if migrate_template_string(tpl) {
+                    if migrate_update_template_string(tpl) {
                         changed = true;
                     }
                 }
             }
             if let Some(serde_json::Value::String(tpl)) = obj.get_mut("update_template") {
-                if migrate_template_string(tpl) {
+                if migrate_update_template_string(tpl) {
                     changed = true;
                 }
             }
@@ -1681,7 +1881,7 @@ impl ConfigManager {
         };
 
         migrate_legacy_webhook_config(&mut config);
-        let changed = migrate_templates_to_remove_md5(&mut config);
+        let changed = migrate_update_templates(&mut config);
 
         let manager = Self {
             config: Arc::new(RwLock::new(config)),

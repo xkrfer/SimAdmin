@@ -10,10 +10,13 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
 use std::fs;
 use std::process::{Command, Output};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use zbus::Connection;
 
@@ -22,16 +25,17 @@ use crate::{
     esim::EsimApiError,
     models::*,
     modem_manager::{
-        self, answer_call, apply_roaming_policy, background_fetch_smsc, current_sim_identity,
+        self, answer_call, apply_roaming_policy, current_sim_identity,
         find_nm_modem_connection_pub, get_airplane_mode, get_band_lock_status,
         get_baseband_restart_progress, get_call_by_path, get_call_settings, get_cell_location,
         get_cells_data, get_data_connection_status, get_device_info_data, get_is_roaming_mm,
         get_network_info_data, get_operators_list, get_radio_mode, get_signal_strength,
         get_sim_info_data_with_cache, hangup_all_calls, hangup_call, list_apn_contexts,
         list_current_calls, make_call, nm_set_autoconnect_pub, power_cycle_sim_for_profile_switch,
-        register_operator_auto, register_operator_manual, restart_baseband, scan_operators,
-        send_sms, set_airplane_mode, set_apn_on_bearer, set_band_lock, set_call_waiting,
-        set_data_connection_with_apn, set_radio_mode, start_cell_monitoring, stop_cell_monitoring,
+        refresh_sim_details_background, register_operator_auto, register_operator_manual,
+        restart_baseband, scan_operators, send_sms, set_airplane_mode, set_apn_on_bearer,
+        set_band_lock, set_call_waiting, set_data_connection_with_apn, set_radio_mode,
+        sim_details_cache_missing, start_cell_monitoring, stop_cell_monitoring,
     },
     state::AppState,
     system_event::{
@@ -46,7 +50,7 @@ use crate::{
 };
 
 const ESIM_SIM_IDENTITY_TIMEOUT_SECS: u64 = 3;
-const ESIM_SIM_ENRICH_TIMEOUT_SECS: u64 = 12;
+const ESIM_CACHED_SIM_IDENTITY_TIMEOUT_MS: u64 = 800;
 const SMS_DB_MAINTENANCE_DELETE_THRESHOLD: usize = 100;
 const SMS_DB_MAINTENANCE_DELAY_SECS: u64 = 60;
 
@@ -93,43 +97,24 @@ fn esim_profile_is_active(profile: &EsimProfile) -> bool {
     )
 }
 
-fn enrich_profiles_with_current_sim(profiles: &mut [EsimProfile], sim: &SimInfoResponse) {
-    if !sim.present {
-        return;
-    }
-    let current_index = profiles
-        .iter()
-        .position(|profile| !sim.iccid.is_empty() && profile.iccid == sim.iccid)
-        .or_else(|| profiles.iter().position(esim_profile_is_active));
+fn esim_profile_state_is_unknown(state: &str) -> bool {
+    let state = state.trim();
+    state.is_empty() || state.eq_ignore_ascii_case("unknown")
+}
 
-    let Some(profile) = current_index.and_then(|index| profiles.get_mut(index)) else {
-        return;
-    };
-
-    if profile.state == "unknown" || !sim.iccid.is_empty() && profile.iccid == sim.iccid {
-        profile.state = "enabled".to_string();
-    }
-    if profile.imsi.is_none() && !sim.imsi.is_empty() {
-        profile.imsi = Some(sim.imsi.clone());
-    }
-    if profile.msisdn.is_none() {
-        if let Some(number) = sim
-            .phone_numbers
-            .iter()
-            .find(|number| !number.trim().is_empty())
-        {
-            profile.msisdn = Some(number.clone());
-        }
-    }
-    if profile.smsc.is_none() && !sim.sms_center.is_empty() {
-        profile.smsc = Some(sim.sms_center.clone());
-    }
-    if profile.mcc.is_none() && !sim.mcc.is_empty() {
-        profile.mcc = Some(sim.mcc.clone());
-    }
-    if profile.mnc.is_none() && !sim.mnc.is_empty() {
-        profile.mnc = Some(sim.mnc.clone());
-    }
+fn sort_esim_profiles_for_display(profiles: &mut [EsimProfile]) {
+    profiles.sort_by(|left, right| {
+        let left_active = esim_profile_is_active(left);
+        let right_active = esim_profile_is_active(right);
+        right_active
+            .cmp(&left_active)
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+            .then_with(|| left.iccid.cmp(&right.iccid))
+    });
 }
 
 fn split_profile_operator_code(code: &str) -> (String, String) {
@@ -156,7 +141,9 @@ fn enrich_profiles_with_current_identity(
         return;
     };
 
-    if profile.state == "unknown" || !identity.iccid.is_empty() && profile.iccid == identity.iccid {
+    if esim_profile_state_is_unknown(&profile.state)
+        || !identity.iccid.is_empty() && profile.iccid == identity.iccid
+    {
         profile.state = "enabled".to_string();
     }
     if profile.imsi.is_none() && !identity.imsi.is_empty() {
@@ -168,6 +155,14 @@ fn enrich_profiles_with_current_identity(
     }
     if profile.mnc.is_none() && !mnc.is_empty() {
         profile.mnc = Some(mnc);
+    }
+
+    if !identity.iccid.is_empty() {
+        for item in profiles {
+            if item.iccid != identity.iccid && esim_profile_state_is_unknown(&item.state) {
+                item.state = "disabled".to_string();
+            }
+        }
     }
 }
 
@@ -185,6 +180,7 @@ fn profile_cache_entry(profile: &EsimProfile) -> EsimProfileCacheEntry {
         iccid: profile.iccid.trim().to_string(),
         name: profile_cache_value(&profile.name),
         provider: profile_cache_value(&profile.provider),
+        state: profile_cache_value(&profile.state),
         profile_class: profile_cache_value(&profile.profile_class),
         imsi: optional_profile_cache_value(&profile.imsi),
         msisdn: optional_profile_cache_value(&profile.msisdn),
@@ -194,6 +190,8 @@ fn profile_cache_entry(profile: &EsimProfile) -> EsimProfileCacheEntry {
         isdp_aid: optional_profile_cache_value(&profile.isdp_aid),
         mcc: optional_profile_cache_value(&profile.mcc),
         mnc: optional_profile_cache_value(&profile.mnc),
+        disable_allowed: profile.disable_allowed,
+        delete_allowed: profile.delete_allowed,
         updated_at: String::new(),
     }
 }
@@ -226,6 +224,7 @@ fn hydrate_profile_from_cache(db: &Database, profile: &mut EsimProfile) {
 
     fill_cached_string(&mut profile.name, cache.name);
     fill_cached_string(&mut profile.provider, cache.provider);
+    fill_cached_string(&mut profile.state, cache.state);
     fill_cached_string(&mut profile.profile_class, cache.profile_class);
     fill_cached_option(&mut profile.imsi, cache.imsi);
     fill_cached_option(&mut profile.msisdn, cache.msisdn);
@@ -256,7 +255,7 @@ fn profile_from_cache_entry(entry: EsimProfileCacheEntry) -> EsimProfile {
         iccid: entry.iccid,
         name: entry.name.unwrap_or_default(),
         provider: entry.provider.unwrap_or_default(),
-        state: "unknown".to_string(),
+        state: entry.state.unwrap_or_else(|| "unknown".to_string()),
         profile_class: entry.profile_class.unwrap_or_default(),
         imsi: entry.imsi,
         msisdn: entry.msisdn,
@@ -266,8 +265,9 @@ fn profile_from_cache_entry(entry: EsimProfileCacheEntry) -> EsimProfile {
         isdp_aid: entry.isdp_aid,
         mcc: entry.mcc,
         mnc: entry.mnc,
-        disable_allowed: Some(true),
-        delete_allowed: Some(true),
+        disable_allowed: entry.disable_allowed.or(Some(true)),
+        delete_allowed: entry.delete_allowed.or(Some(true)),
+        updated_at: Some(entry.updated_at.clone()),
         raw: json!({
             "source": "cache",
             "updated_at": entry.updated_at,
@@ -288,6 +288,65 @@ fn cached_profiles_requested(query: &std::collections::HashMap<String, String>) 
 }
 
 // ============ 工作模式 / eSIM ============
+
+fn live_refresh_requested(query: &std::collections::HashMap<String, String>) -> bool {
+    query
+        .get("live")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn euicc_cache_key(info: &EsimEuiccInfo) -> String {
+    let eid = info.eid.trim();
+    if eid.is_empty() {
+        "default".to_string()
+    } else {
+        format!("eid:{eid}")
+    }
+}
+
+fn euicc_cache_entry(info: &EsimEuiccInfo) -> EsimEuiccCacheEntry {
+    EsimEuiccCacheEntry {
+        cache_key: euicc_cache_key(info),
+        eid: info.eid.clone(),
+        status: info.status.clone(),
+        manufacturer: info.manufacturer.clone(),
+        memory_total_kb: info.memory_total_kb,
+        memory_available_kb: info.memory_available_kb,
+        memory_total_customizable: info.memory_total_customizable,
+        raw: info.raw.to_string(),
+        updated_at: info.updated_at.clone().unwrap_or_default(),
+    }
+}
+
+fn euicc_from_cache_entry(entry: EsimEuiccCacheEntry) -> EsimEuiccInfo {
+    let mut raw: serde_json::Value = serde_json::from_str(&entry.raw).unwrap_or_else(|_| json!({}));
+    if let Some(object) = raw.as_object_mut() {
+        object.insert("source".to_string(), json!("cache"));
+        object.insert("updated_at".to_string(), json!(entry.updated_at.clone()));
+    } else {
+        raw = json!({
+            "source": "cache",
+            "updated_at": entry.updated_at,
+        });
+    }
+
+    EsimEuiccInfo {
+        eid: entry.eid,
+        status: entry.status,
+        manufacturer: entry.manufacturer,
+        memory_total_kb: entry.memory_total_kb,
+        memory_available_kb: entry.memory_available_kb,
+        memory_total_customizable: entry.memory_total_customizable,
+        updated_at: Some(entry.updated_at),
+        raw,
+    }
+}
 
 /// GET /api/work-mode
 pub async fn get_work_mode_handler(State(app): State<AppState>) -> impl IntoResponse {
@@ -423,12 +482,40 @@ pub async fn set_esim_config_handler(
 }
 
 /// GET /api/esim/euicc
-pub async fn get_esim_euicc_handler(State(app): State<AppState>) -> impl IntoResponse {
+pub async fn get_esim_euicc_handler(
+    State(app): State<AppState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !live_refresh_requested(&query) {
+        match app.database.latest_esim_euicc_cache() {
+            Ok(Some(entry)) => {
+                return (
+                    StatusCode::OK,
+                    Json(ApiResponse::success_with_message(
+                        "Cached eUICC",
+                        euicc_from_cache_entry(entry),
+                    )),
+                );
+            }
+            Ok(None) => {}
+            Err(err) => warn!(error = %err, "Failed to read eUICC cache"),
+        }
+    }
+
     match app.esim_supervisor.get_euicc_info().await {
-        Ok(data) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message("Success", data)),
-        ),
+        Ok(mut data) => {
+            data.updated_at = Some(chrono::Utc::now().to_rfc3339());
+            if let Err(err) = app
+                .database
+                .upsert_esim_euicc_cache(&euicc_cache_entry(&data))
+            {
+                warn!(error = %err, "Failed to write eUICC cache");
+            }
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message("Success", data)),
+            )
+        }
         Err(err) => esim_error_response::<EsimEuiccInfo>(err),
     }
 }
@@ -440,15 +527,38 @@ pub async fn get_esim_profiles_handler(
 ) -> impl IntoResponse {
     if cached_profiles_requested(&query) {
         return match app.database.list_esim_profile_cache() {
-            Ok(entries) => (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message(
-                    "Cached profiles",
-                    EsimProfilesResponse {
-                        profiles: entries.into_iter().map(profile_from_cache_entry).collect(),
-                    },
-                )),
-            ),
+            Ok(entries) => {
+                let mut profiles: Vec<EsimProfile> =
+                    entries.into_iter().map(profile_from_cache_entry).collect();
+                let needs_identity = profiles
+                    .iter()
+                    .any(|profile| esim_profile_state_is_unknown(&profile.state));
+                if needs_identity {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(ESIM_CACHED_SIM_IDENTITY_TIMEOUT_MS),
+                        current_sim_identity(&app.dbus_conn),
+                    )
+                    .await
+                    {
+                        Ok(Some(identity)) => {
+                            enrich_profiles_with_current_identity(&mut profiles, &identity)
+                        }
+                        Ok(None) => {}
+                        Err(_) => warn!(
+                            timeout_ms = ESIM_CACHED_SIM_IDENTITY_TIMEOUT_MS,
+                            "Timed out enriching cached eSIM profiles with current SIM identity"
+                        ),
+                    }
+                }
+                sort_esim_profiles_for_display(&mut profiles);
+                (
+                    StatusCode::OK,
+                    Json(ApiResponse::success_with_message(
+                        "Cached profiles",
+                        EsimProfilesResponse { profiles },
+                    )),
+                )
+            }
             Err(err) => (
                 StatusCode::OK,
                 Json(ApiResponse::<EsimProfilesResponse>::error(format!(
@@ -476,22 +586,8 @@ pub async fn get_esim_profiles_handler(
                     "Timed out enriching eSIM profiles with current SIM identity"
                 ),
             }
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(ESIM_SIM_ENRICH_TIMEOUT_SECS),
-                get_sim_info_data_with_cache(&app.dbus_conn, Some(&app.database)),
-            )
-            .await
-            {
-                Ok(Ok(sim_info)) => enrich_profiles_with_current_sim(&mut data.profiles, &sim_info),
-                Ok(Err(err)) => {
-                    warn!(error = %err, "Failed to enrich eSIM profiles with current SIM")
-                }
-                Err(_) => warn!(
-                    timeout_secs = ESIM_SIM_ENRICH_TIMEOUT_SECS,
-                    "Timed out enriching eSIM profiles with current SIM"
-                ),
-            }
             cache_esim_profiles(&app.database, &data.profiles);
+            sort_esim_profiles_for_display(&mut data.profiles);
             (
                 StatusCode::OK,
                 Json(ApiResponse::success_with_message("Success", data)),
@@ -752,6 +848,7 @@ pub async fn download_esim_profile_handler(
                         iccid: profile.iccid.clone(),
                         name: Some(profile.name.clone()),
                         provider: Some(profile.provider.clone()),
+                        state: Some(profile.state.clone()),
                         profile_class: Some(profile.profile_class.clone()),
                         imsi: profile.imsi.clone(),
                         msisdn: profile.msisdn.clone(),
@@ -761,6 +858,8 @@ pub async fn download_esim_profile_handler(
                         isdp_aid: profile.isdp_aid.clone(),
                         mcc: profile.mcc.clone(),
                         mnc: profile.mnc.clone(),
+                        disable_allowed: profile.disable_allowed,
+                        delete_allowed: profile.delete_allowed,
                         updated_at: chrono::Utc::now().to_rfc3339(),
                     };
 
@@ -825,6 +924,7 @@ pub async fn download_esim_profile_handler(
                                             iccid: p.iccid.clone(),
                                             name: Some(p.name.clone()),
                                             provider: Some(p.provider.clone()),
+                                            state: Some(p.state.clone()),
                                             profile_class: Some(p.profile_class.clone()),
                                             imsi: p.imsi.clone(),
                                             msisdn: p.msisdn.clone(),
@@ -834,6 +934,8 @@ pub async fn download_esim_profile_handler(
                                             isdp_aid: p.isdp_aid.clone(),
                                             mcc: p.mcc.clone(),
                                             mnc: p.mnc.clone(),
+                                            disable_allowed: p.disable_allowed,
+                                            delete_allowed: p.delete_allowed,
                                             updated_at: chrono::Utc::now().to_rfc3339(),
                                         };
                                         if let Err(err) =
@@ -900,6 +1002,7 @@ pub async fn download_esim_profile_handler(
                                     iccid: p.iccid.clone(),
                                     name: Some(p.name.clone()),
                                     provider: Some(p.provider.clone()),
+                                    state: Some(p.state.clone()),
                                     profile_class: Some(p.profile_class.clone()),
                                     imsi: p.imsi.clone(),
                                     msisdn: p.msisdn.clone(),
@@ -909,6 +1012,8 @@ pub async fn download_esim_profile_handler(
                                     isdp_aid: p.isdp_aid.clone(),
                                     mcc: p.mcc.clone(),
                                     mnc: p.mnc.clone(),
+                                    disable_allowed: p.disable_allowed,
+                                    delete_allowed: p.delete_allowed,
                                     updated_at: chrono::Utc::now().to_rfc3339(),
                                 };
                                 if let Ok(_) = app.database.upsert_esim_profile_cache(&entry) {
@@ -986,20 +1091,44 @@ pub async fn get_device_info(State(conn): State<Arc<Connection>>) -> impl IntoRe
 
 // ============ SIM 卡 ============
 
+fn sim_identity_from_response(data: &SimInfoResponse) -> modem_manager::SimIdentity {
+    let mut operator_id = data.registered_operator_code.trim().to_string();
+    if operator_id.is_empty() && !data.mcc.is_empty() && !data.mnc.is_empty() {
+        operator_id = format!("{}{}", data.mcc, data.mnc);
+    }
+    modem_manager::SimIdentity {
+        iccid: data.iccid.clone(),
+        imsi: data.imsi.clone(),
+        operator_id,
+    }
+}
+
+fn maybe_refresh_sim_details_after_fast_response(
+    conn: &Arc<Connection>,
+    db: &Arc<Database>,
+    data: &SimInfoResponse,
+) {
+    if !data.present {
+        return;
+    }
+    let identity = sim_identity_from_response(data);
+    if !sim_details_cache_missing(db, &identity) {
+        return;
+    }
+    let conn_bg = Arc::clone(conn);
+    let db_bg = Arc::clone(db);
+    tokio::spawn(async move {
+        refresh_sim_details_background(&conn_bg, &db_bg, false).await;
+    });
+}
+
 /// GET /api/sim
 pub async fn get_sim_info(
     State((conn, db)): State<(Arc<Connection>, Arc<Database>)>,
 ) -> impl IntoResponse {
     match get_sim_info_data_with_cache(&conn, Some(&db)).await {
         Ok(data) => {
-            // 如果 SMSC 为空，后台异步通过 AT+CRSM 读取 EF_SMSP 并缓存
-            if data.sms_center.is_empty() {
-                let conn_bg = Arc::clone(&conn);
-                let db_bg = Arc::clone(&db);
-                tokio::spawn(async move {
-                    background_fetch_smsc(&conn_bg, &db_bg).await;
-                });
-            }
+            maybe_refresh_sim_details_after_fast_response(&conn, &db, &data);
             (
                 StatusCode::OK,
                 Json(ApiResponse::success_with_message("Success", data)),
@@ -1013,6 +1142,25 @@ pub async fn get_sim_info(
             ))),
         ),
     }
+}
+
+/// POST /api/sim/details/refresh
+pub async fn refresh_sim_details_handler(
+    State((conn, db)): State<(Arc<Connection>, Arc<Database>)>,
+) -> impl IntoResponse {
+    let conn_bg = Arc::clone(&conn);
+    let db_bg = Arc::clone(&db);
+    tokio::spawn(async move {
+        refresh_sim_details_background(&conn_bg, &db_bg, true).await;
+    });
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "SIM details refresh started",
+            json!({}),
+        )),
+    )
 }
 
 /// POST /api/sim/cache
@@ -2182,7 +2330,7 @@ pub async fn get_airplane_mode_handler(State(conn): State<Arc<Connection>>) -> i
 
 // ============ 短信功能 ============
 
-use crate::db::{Database, EsimProfileCacheEntry};
+use crate::db::{Database, EsimEuiccCacheEntry, EsimProfileCacheEntry};
 
 fn schedule_sms_db_maintenance(app: &AppState, deleted: usize) {
     if deleted < SMS_DB_MAINTENANCE_DELETE_THRESHOLD {
@@ -2997,41 +3145,69 @@ pub(crate) fn read_temperature_sensors() -> Vec<ThermalZone> {
     sensors
 }
 
-/// GET /api/stats
-pub async fn get_system_stats(State(dbus_conn): State<Arc<Connection>>) -> impl IntoResponse {
-    let result: Result<SystemStatsResponse, String> = async {
-        let interfaces =
-            get_active_interfaces().map_err(|e| format!("Failed to get interfaces: {}", e))?;
+static SYSTEM_STATS_SNAPSHOT: OnceLock<Arc<RwLock<Option<SystemStatsResponse>>>> = OnceLock::new();
+const SYSTEM_STATS_LOW_FREQUENCY_REFRESH_SECS: u64 = 10;
 
-        let mut initial: Vec<(String, u64, u64)> = Vec::new();
-        for iface in &interfaces {
-            if let Ok((rx, tx)) = read_interface_stats(iface, Some(&dbus_conn)).await {
-                initial.push((iface.clone(), rx, tx));
-            }
+#[derive(Default)]
+struct SystemStatsSamplerState {
+    previous_network: HashMap<String, (u64, u64)>,
+    last_low_frequency_refresh: Option<Instant>,
+    memory: MemoryInfo,
+    disk: Vec<DiskInfo>,
+    uptime: UptimeInfo,
+    system_info: SystemInfo,
+    temperature: Vec<ThermalZone>,
+}
+
+fn system_stats_snapshot() -> Arc<RwLock<Option<SystemStatsResponse>>> {
+    Arc::clone(SYSTEM_STATS_SNAPSHOT.get_or_init(|| Arc::new(RwLock::new(None))))
+}
+
+async fn collect_system_stats_snapshot(
+    dbus_conn: &Connection,
+    state: &mut SystemStatsSamplerState,
+    interval_seconds: f64,
+) -> Result<SystemStatsResponse, String> {
+    let interfaces =
+        get_active_interfaces().map_err(|e| format!("Failed to get interfaces: {}", e))?;
+
+    let mut speed_data = Vec::new();
+    let elapsed = interval_seconds.max(0.001);
+    for iface in &interfaces {
+        if let Ok((rx, tx)) = read_interface_stats(iface, Some(dbus_conn)).await {
+            let (rx_speed, tx_speed) = state
+                .previous_network
+                .get(iface)
+                .map(|(prev_rx, prev_tx)| {
+                    (
+                        (rx.saturating_sub(*prev_rx) as f64 / elapsed) as u64,
+                        (tx.saturating_sub(*prev_tx) as f64 / elapsed) as u64,
+                    )
+                })
+                .unwrap_or((0, 0));
+            speed_data.push(NetworkSpeed {
+                interface: iface.clone(),
+                rx_bytes_per_sec: rx_speed,
+                tx_bytes_per_sec: tx_speed,
+                total_rx_bytes: rx,
+                total_tx_bytes: tx,
+            });
+            state.previous_network.insert(iface.clone(), (rx, tx));
         }
+    }
+    state
+        .previous_network
+        .retain(|iface, _| interfaces.iter().any(|current| current == iface));
 
-        // 并行执行 CPU 采样 (200ms) 和网速采样间隔 (1000ms)，节省 200ms
-        let (cpu_usage, _) = tokio::join!(
-            async { sample_cpu_usage().await.unwrap_or(0.0) },
-            tokio::time::sleep(tokio::time::Duration::from_millis(1000)),
-        );
+    let cpu_usage = sample_cpu_usage().await.unwrap_or(0.0);
+    let mut cpu_load = read_cpu_load_sync().unwrap_or_default();
+    cpu_load.load_percent = cpu_usage;
 
-        let mut speed_data = Vec::new();
-        let elapsed = 1.0_f64;
-        for (interface, rx1, tx1) in &initial {
-            if let Ok((rx2, tx2)) = read_interface_stats(interface, Some(&dbus_conn)).await {
-                let rx_speed = rx2.saturating_sub(*rx1);
-                let tx_speed = tx2.saturating_sub(*tx1);
-                speed_data.push(NetworkSpeed {
-                    interface: interface.clone(),
-                    rx_bytes_per_sec: rx_speed,
-                    tx_bytes_per_sec: tx_speed,
-                    total_rx_bytes: rx2,
-                    total_tx_bytes: tx2,
-                });
-            }
-        }
-
+    let should_refresh_low_frequency = state
+        .last_low_frequency_refresh
+        .map(|last| last.elapsed() >= Duration::from_secs(SYSTEM_STATS_LOW_FREQUENCY_REFRESH_SECS))
+        .unwrap_or(true);
+    if should_refresh_low_frequency {
         let (total, available, cached, buffers) = read_memory_info()?;
         let used = total.saturating_sub(available);
         let used_percent = if total > 0 {
@@ -3039,50 +3215,76 @@ pub async fn get_system_stats(State(dbus_conn): State<Arc<Connection>>) -> impl 
         } else {
             0.0
         };
-        let disk = read_disk_info();
-        let mut cpu_load = read_cpu_load_sync().unwrap_or_default();
-        cpu_load.load_percent = cpu_usage;
         let (uptime, idle) = read_uptime()?;
-        let formatted = format_uptime(uptime);
-        let system_info = read_system_info()?;
-        let temperature = read_temperature_sensors();
-
-        Ok(SystemStatsResponse {
-            network_speed: NetworkSpeedResponse {
-                interfaces: speed_data,
-                interval_seconds: elapsed,
-            },
-            memory: MemoryInfo {
-                total_bytes: total,
-                available_bytes: available,
-                used_bytes: used,
-                used_percent,
-                cached_bytes: cached,
-                buffers_bytes: buffers,
-            },
-            disk,
-            cpu_load,
-            uptime: UptimeInfo {
-                uptime_seconds: uptime,
-                idle_seconds: idle,
-                uptime_formatted: formatted,
-            },
-            system_info,
-            temperature,
-        })
+        state.memory = MemoryInfo {
+            total_bytes: total,
+            available_bytes: available,
+            used_bytes: used,
+            used_percent,
+            cached_bytes: cached,
+            buffers_bytes: buffers,
+        };
+        state.disk = read_disk_info();
+        state.uptime = UptimeInfo {
+            uptime_seconds: uptime,
+            idle_seconds: idle,
+            uptime_formatted: format_uptime(uptime),
+        };
+        state.system_info = read_system_info()?;
+        state.temperature = read_temperature_sensors();
+        state.last_low_frequency_refresh = Some(Instant::now());
     }
-    .await;
 
-    match result {
-        Ok(data) => (
+    Ok(SystemStatsResponse {
+        network_speed: NetworkSpeedResponse {
+            interfaces: speed_data,
+            interval_seconds: elapsed,
+        },
+        memory: state.memory.clone(),
+        disk: state.disk.clone(),
+        cpu_load,
+        uptime: state.uptime.clone(),
+        system_info: state.system_info.clone(),
+        temperature: state.temperature.clone(),
+    })
+}
+
+pub fn spawn_system_stats_sampler(dbus_conn: Arc<Connection>) {
+    let snapshot = system_stats_snapshot();
+    tokio::spawn(async move {
+        let mut sampler_state = SystemStatsSamplerState::default();
+        let mut last_sample = Instant::now();
+        loop {
+            let elapsed = last_sample.elapsed().as_secs_f64().max(1.0);
+            last_sample = Instant::now();
+            match collect_system_stats_snapshot(&dbus_conn, &mut sampler_state, elapsed).await {
+                Ok(stats) => {
+                    *snapshot.write().await = Some(stats);
+                }
+                Err(err) => warn!(error = %err, "Failed to sample system stats"),
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
+/// GET /api/stats
+pub async fn get_system_stats(State(_dbus_conn): State<Arc<Connection>>) -> impl IntoResponse {
+    let snapshot = system_stats_snapshot();
+    if let Some(data) = snapshot.read().await.clone() {
+        return (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", data)),
-        ),
-        Err(msg) => (
-            StatusCode::OK,
-            Json(ApiResponse::<SystemStatsResponse>::error(msg)),
-        ),
+        );
     }
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "No system stats sample yet",
+            SystemStatsResponse::default(),
+        )),
+    )
 }
 
 /// GET /api/stats/cpu
@@ -3975,6 +4177,61 @@ mod tests {
         assert_eq!(profiles[1].mcc.as_deref(), Some("234"));
         assert_eq!(profiles[1].mnc.as_deref(), Some("336"));
         assert!(profiles[0].mcc.is_none());
+    }
+
+    #[test]
+    fn enriches_unknown_cached_profile_states_from_current_sim_identity() {
+        let mut profiles = vec![
+            EsimProfile {
+                iccid: "profile-a".to_string(),
+                state: "unknown".to_string(),
+                ..Default::default()
+            },
+            EsimProfile {
+                iccid: "profile-b".to_string(),
+                state: "unknown".to_string(),
+                ..Default::default()
+            },
+        ];
+        let identity = SimIdentity {
+            iccid: "profile-b".to_string(),
+            imsi: String::new(),
+            operator_id: String::new(),
+        };
+
+        enrich_profiles_with_current_identity(&mut profiles, &identity);
+
+        assert_eq!(profiles[0].state, "disabled");
+        assert_eq!(profiles[1].state, "enabled");
+    }
+
+    #[test]
+    fn sorts_esim_profiles_with_enabled_first_and_stable_fallback() {
+        let mut profiles = vec![
+            EsimProfile {
+                iccid: "300".to_string(),
+                name: "Charlie".to_string(),
+                state: "disabled".to_string(),
+                ..Default::default()
+            },
+            EsimProfile {
+                iccid: "100".to_string(),
+                name: "Alpha".to_string(),
+                state: "disabled".to_string(),
+                ..Default::default()
+            },
+            EsimProfile {
+                iccid: "200".to_string(),
+                name: "Bravo".to_string(),
+                state: "enabled".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        sort_esim_profiles_for_display(&mut profiles);
+
+        let order: Vec<&str> = profiles.iter().map(|profile| profile.iccid.as_str()).collect();
+        assert_eq!(order, vec!["200", "100", "300"]);
     }
 
     #[test]

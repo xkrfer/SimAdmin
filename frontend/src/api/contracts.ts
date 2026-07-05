@@ -60,6 +60,7 @@ export interface EsimEuiccInfo {
   memory_total_kb?: number
   memory_available_kb?: number
   memory_total_customizable?: boolean
+  updated_at?: string
   raw: unknown
 }
 
@@ -84,6 +85,7 @@ export interface EsimProfile {
   mnc?: string
   disable_allowed?: boolean
   delete_allowed?: boolean
+  updated_at?: string
   raw: unknown
 }
 
@@ -598,6 +600,8 @@ export type NotificationChannelKey =
   | 'dingtalk_app'
   | 'feishu_robot'
   | 'telegram'
+  | 'email'
+  | 'serverchan3'
 
 export type NotificationEventType = 'sms' | 'ddns' | 'version_update' | 'system_event' | 'device_status' | 'automation'
 export type NotificationLogStatus = 'success' | 'failed' | 'no_available_channel' | 'quiet_hours' | 'unmatched'
@@ -683,6 +687,26 @@ export interface TelegramConfig extends MessageChannelConfig {
   disable_web_page_preview: boolean
 }
 
+export interface EmailConfig extends MessageChannelConfig {
+  smtp_host: string
+  smtp_port: number
+  smtp_security: 'implicit_tls' | 'starttls' | 'none'
+  allow_insecure_tls: boolean
+  username: string
+  password: string
+  sender_address: string
+  sender_name: string
+  receiver_addresses: string
+  message_format: 'plain' | 'html'
+}
+
+export interface ServerChan3Config extends MessageChannelConfig {
+  send_key: string
+  uid: string
+  channel: string
+  openid: string
+}
+
 export interface NotificationConfig {
   version: number
   channels: NotificationChannelInstance[]
@@ -740,6 +764,7 @@ export interface NotificationRule {
   matcher: RuleMatcher
   channel_ids: string[]
   event_codes: string[]
+  title_template: string
   template: string
   quiet_hours: QuietHoursSchedule[]
   ddns_failure_threshold: number
@@ -818,7 +843,7 @@ export const DEFAULT_DDNS_TEMPLATE = `{
 export const DEFAULT_UPDATE_TEMPLATE = `{
   "msg_type": "text",
   "content": {
-    "text": "🚀 SimAdmin 发现新版本\\n固件包: {{asset_name}}\\n版本号: {{version}}\\nCommit: {{commit}}\\n时间: {{time}}\\n来源: {{own_number}}\\n\\n请前往 OTA 更新页面的在线更新模块检查更新，可一键下载并升级。"
+    "text": "🚀 SimAdmin 发现新版本\\n固件包: {{asset_name}}\\n版本号: {{version}}\\n时间: {{time}}\\n来源: {{own_number}}\\n\\n请前往 OTA 更新页面的在线更新模块检查更新，可一键下载并升级。"
   }
 }`
 
@@ -849,7 +874,6 @@ IP类型: {{ip_type}}
 export const DEFAULT_PLAIN_UPDATE_TEMPLATE = `🚀 SimAdmin 发现新版本
 固件包: {{asset_name}}
 版本号: {{version}}
-Commit: {{commit}}
 时间: {{time}}
 来源: {{own_number}}
 

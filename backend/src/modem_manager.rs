@@ -77,7 +77,9 @@ const MODEM_AT_COMMAND_TIMEOUT_SECS: u64 = 2;
 const SMSC_HELPER_FALLBACK_TIMEOUT_SECS: u64 = 4;
 const SMSC_BACKGROUND_AT_TIMEOUT_SECS: u64 = 10;
 
+#[allow(dead_code)]
 static SMSC_BACKGROUND_RUNNING: AtomicBool = AtomicBool::new(false);
+static SIM_DETAILS_BACKGROUND_RUNNING: AtomicBool = AtomicBool::new(false);
 
 type InterfaceProperties = HashMap<String, OwnedValue>;
 type ManagedObjects = HashMap<OwnedObjectPath, HashMap<String, InterfaceProperties>>;
@@ -739,7 +741,11 @@ fn sim_identity_keys(identity: &SimIdentity) -> Vec<String> {
 }
 
 fn smsc_identity_keys(identity: &SimIdentity) -> Vec<String> {
-    sim_identity_keys(identity)
+    if !identity.iccid.is_empty() {
+        vec![format!("iccid:{}", identity.iccid)]
+    } else {
+        sim_identity_keys(identity)
+    }
 }
 
 fn own_number_identity_key(identity: &SimIdentity) -> Option<String> {
@@ -750,6 +756,10 @@ fn own_number_identity_key(identity: &SimIdentity) -> Option<String> {
     }
 }
 
+fn sms_storage_identity_key(identity: &SimIdentity) -> Option<String> {
+    own_number_identity_key(identity)
+}
+
 pub fn cache_smsc_for_identity(
     db: &Database,
     identity: &SimIdentity,
@@ -757,9 +767,6 @@ pub fn cache_smsc_for_identity(
     source: &str,
 ) {
     let sms_center = normalize_smsc(sms_center);
-    if sms_center.is_empty() {
-        return;
-    }
     let Some(identity_key) = smsc_identity_keys(identity).into_iter().next() else {
         return;
     };
@@ -773,14 +780,20 @@ pub fn cache_smsc_for_identity(
     );
 }
 
-fn cached_smsc_for_identity(db: &Database, identity: &SimIdentity) -> String {
+fn smsc_cache_entry_for_identity(
+    db: &Database,
+    identity: &SimIdentity,
+) -> Option<crate::db::SmscCacheEntry> {
     let keys = smsc_identity_keys(identity);
     if keys.is_empty() {
-        return String::new();
+        return None;
     }
-    db.get_smsc_cache(&keys)
-        .ok()
-        .flatten()
+    db.get_smsc_cache(&keys).ok().flatten()
+}
+
+#[allow(dead_code)]
+fn cached_smsc_for_identity(db: &Database, identity: &SimIdentity) -> String {
+    smsc_cache_entry_for_identity(db, identity)
         .map(|entry| normalize_smsc(&entry.sms_center))
         .unwrap_or_default()
 }
@@ -792,9 +805,6 @@ pub fn cache_own_numbers_for_identity(
     source: &str,
 ) {
     let phone_numbers = normalize_phone_numbers(phone_numbers.iter().cloned());
-    if phone_numbers.is_empty() {
-        return;
-    }
     let Some(identity_key) = own_number_identity_key(identity) else {
         return;
     };
@@ -808,16 +818,61 @@ pub fn cache_own_numbers_for_identity(
     );
 }
 
+fn own_number_cache_entry_for_identity(
+    db: &Database,
+    identity: &SimIdentity,
+) -> Option<crate::db::OwnNumberCacheEntry> {
+    let Some(identity_key) = own_number_identity_key(identity) else {
+        return None;
+    };
+    db.get_own_number_cache(&[identity_key]).ok().flatten()
+}
+
 #[allow(dead_code)]
 fn cached_own_numbers_for_identity(db: &Database, identity: &SimIdentity) -> Vec<String> {
-    let Some(identity_key) = own_number_identity_key(identity) else {
-        return Vec::new();
-    };
-    db.get_own_number_cache(&[identity_key])
-        .ok()
-        .flatten()
+    own_number_cache_entry_for_identity(db, identity)
         .map(|entry| normalize_phone_numbers(entry.phone_numbers))
         .unwrap_or_default()
+}
+
+fn sms_storage_cache_entry_for_identity(
+    db: &Database,
+    identity: &SimIdentity,
+) -> Option<crate::db::SmsStorageCacheEntry> {
+    let Some(identity_key) = sms_storage_identity_key(identity) else {
+        return None;
+    };
+    db.get_sms_storage_cache(&[identity_key]).ok().flatten()
+}
+
+fn cache_sms_storage_for_identity(
+    db: &Database,
+    identity: &SimIdentity,
+    sms_used: Option<u32>,
+    sms_total: Option<u32>,
+    source: &str,
+) {
+    let Some(identity_key) = sms_storage_identity_key(identity) else {
+        return;
+    };
+    let _ = db.upsert_sms_storage_cache(
+        &identity_key,
+        &identity.iccid,
+        &identity.imsi,
+        &identity.operator_id,
+        sms_used,
+        sms_total,
+        source,
+    );
+}
+
+pub fn sim_details_cache_missing(db: &Database, identity: &SimIdentity) -> bool {
+    if identity.iccid.is_empty() {
+        return false;
+    }
+    own_number_cache_entry_for_identity(db, identity).is_none()
+        || smsc_cache_entry_for_identity(db, identity).is_none()
+        || sms_storage_cache_entry_for_identity(db, identity).is_none()
 }
 
 fn extract_mode_pairs(value: &OwnedValue) -> Vec<(u32, u32)> {
@@ -1308,6 +1363,7 @@ pub async fn get_device_info_data(conn: &Connection) -> zbus::Result<DeviceInfoR
     })
 }
 
+#[allow(dead_code)]
 async fn messaging_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
     let Ok(props) = get_all_properties(conn, modem_path, MM_MESSAGING).await else {
         return String::new();
@@ -1315,6 +1371,7 @@ async fn messaging_smsc_fallback(conn: &Connection, modem_path: &str) -> String 
     extract_smsc_property(&props)
 }
 
+#[allow(dead_code)]
 async fn sms_object_smsc(conn: &Connection, sms_path: &str) -> String {
     let Ok(props) = get_all_properties(conn, sms_path, MM_SMS).await else {
         return String::new();
@@ -1322,6 +1379,7 @@ async fn sms_object_smsc(conn: &Connection, sms_path: &str) -> String {
     extract_smsc_property(&props)
 }
 
+#[allow(dead_code)]
 async fn existing_sms_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
     let Ok(proxy) = Proxy::new(conn, MM_SERVICE, modem_path, MM_MESSAGING).await else {
         return String::new();
@@ -1689,6 +1747,7 @@ async fn send_at_via_modem_command(
 /// 后台异步获取 SMSC 并写入缓存。
 /// 优先使用 AT+CRSM 读 EF_SMSP（可靠且快速）。
 /// 需要 ModemManager 以 --debug 模式运行以支持 Modem.Command 接口。
+#[allow(dead_code)]
 pub async fn background_fetch_smsc(conn: &Connection, db: &Database) {
     if SMSC_BACKGROUND_RUNNING.swap(true, Ordering::SeqCst) {
         return;
@@ -1699,6 +1758,7 @@ pub async fn background_fetch_smsc(conn: &Connection, db: &Database) {
     result
 }
 
+#[allow(dead_code)]
 async fn background_fetch_smsc_inner(conn: &Connection, db: &Database) {
     let identity = current_sim_identity(conn).await;
     let identity = match identity {
@@ -1744,6 +1804,88 @@ async fn background_fetch_smsc_inner(conn: &Connection, db: &Database) {
     }
 
     info!("Background SMSC fetch: all methods exhausted");
+}
+
+pub async fn refresh_sim_details_background(conn: &Connection, db: &Database, force: bool) {
+    if SIM_DETAILS_BACKGROUND_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    refresh_sim_details_background_inner(conn, db, force).await;
+    SIM_DETAILS_BACKGROUND_RUNNING.store(false, Ordering::SeqCst);
+}
+
+async fn refresh_sim_details_background_inner(conn: &Connection, db: &Database, force: bool) {
+    let Some(identity) = current_sim_identity(conn).await else {
+        info!("SIM details refresh skipped: no SIM identity");
+        return;
+    };
+    if identity.iccid.is_empty() && identity.imsi.is_empty() {
+        info!("SIM details refresh skipped: empty SIM identity");
+        return;
+    }
+
+    let modem_path = find_modem_path(conn).await.ok();
+
+    if force || own_number_cache_entry_for_identity(db, &identity).is_none() {
+        let mut phone_numbers = Vec::new();
+        if let Some(path) = modem_path.as_deref() {
+            phone_numbers = simple_status_own_numbers_fallback(conn, path).await;
+            if phone_numbers.is_empty() {
+                phone_numbers = active_protocol_own_numbers_fallback(conn, path).await;
+            }
+        }
+        if phone_numbers.is_empty() {
+            phone_numbers = direct_at_own_numbers_fallback(conn).await;
+        }
+        phone_numbers = normalize_phone_numbers(phone_numbers);
+        let source = if phone_numbers.is_empty() {
+            "empty"
+        } else {
+            "background"
+        };
+        cache_own_numbers_for_identity(db, &identity, &phone_numbers, source);
+    }
+
+    if force || smsc_cache_entry_for_identity(db, &identity).is_none() {
+        let mut sms_center = direct_at_ef_smsp_fallback(conn).await;
+        let mut source = "ef_smsp";
+        if sms_center.is_empty() {
+            if let Some(path) = modem_path.as_deref() {
+                if let Ok(output) = send_at_via_modem_command(conn, path, "AT+CSCA?").await {
+                    sms_center = parse_smsc_from_at_output(&output);
+                    source = "background_at";
+                }
+            }
+        }
+        if sms_center.is_empty() {
+            if let Some(path) = modem_path.as_deref() {
+                sms_center = active_protocol_smsc_fallback(conn, path).await;
+                source = "protocol";
+            }
+        }
+        if sms_center.is_empty() {
+            source = "empty";
+        }
+        cache_smsc_for_identity(db, &identity, &sms_center, source);
+    }
+
+    if force || sms_storage_cache_entry_for_identity(db, &identity).is_none() {
+        let mut storage = None;
+        if let Some(path) = modem_path.as_deref() {
+            if let Ok(output) = send_at_via_modem_command(conn, path, "AT+CPMS?").await {
+                storage = parse_sms_storage_info(&output);
+            }
+        }
+        match storage {
+            Some((used, total)) => {
+                cache_sms_storage_for_identity(db, &identity, Some(used), Some(total), "cpms");
+            }
+            None => {
+                cache_sms_storage_for_identity(db, &identity, None, None, "empty");
+            }
+        }
+    }
 }
 
 async fn modem_command_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
@@ -1850,7 +1992,6 @@ pub async fn get_sim_info_data_with_cache(
     }
 
     let sim_props = get_all_properties(conn, &sim_path, MM_SIM).await?;
-    let msg_smsc = messaging_smsc_fallback(conn, &modem_path).await;
     let iccid = crate::utils::normalize_iccid(
         &sim_props
             .get("SimIdentifier")
@@ -1898,30 +2039,12 @@ pub async fn get_sim_info_data_with_cache(
         }
     }
     if phone_numbers.is_empty() {
-        phone_numbers = simple_status_own_numbers_fallback(conn, &modem_path).await;
-        if !phone_numbers.is_empty() {
-            if let Some(db) = db {
-                cache_own_numbers_for_identity(db, &identity, &phone_numbers, "dbus_status");
-            }
-        }
-    }
-    if phone_numbers.is_empty() {
         if let Some(db) = db {
-            if let Some(identity_key) = own_number_identity_key(&identity) {
-                if let Ok(Some(entry)) = db.get_own_number_cache(&[identity_key]) {
-                    phone_numbers = normalize_phone_numbers(entry.phone_numbers);
-                    if entry.source == "manual" {
-                        phone_number_is_manual = true;
-                    }
+            if let Some(entry) = own_number_cache_entry_for_identity(db, &identity) {
+                phone_numbers = normalize_phone_numbers(entry.phone_numbers);
+                if entry.source == "manual" {
+                    phone_number_is_manual = true;
                 }
-            }
-        }
-    }
-    if phone_numbers.is_empty() {
-        phone_numbers = active_protocol_own_numbers_fallback(conn, &modem_path).await;
-        if !phone_numbers.is_empty() {
-            if let Some(db) = db {
-                cache_own_numbers_for_identity(db, &identity, &phone_numbers, "protocol");
             }
         }
     }
@@ -1929,40 +2052,18 @@ pub async fn get_sim_info_data_with_cache(
     phone_numbers.dedup();
 
     let mut sms_center = extract_smsc_property(&sim_props);
-    if sms_center.is_empty() {
-        sms_center = msg_smsc;
-    }
     if !sms_center.is_empty() {
         if let Some(db) = db {
             cache_smsc_for_identity(db, &identity, &sms_center, "dbus");
         }
     }
     if sms_center.is_empty() {
-        sms_center = existing_sms_smsc_fallback(conn, &modem_path).await;
-        if !sms_center.is_empty() {
-            if let Some(db) = db {
-                cache_smsc_for_identity(db, &identity, &sms_center, "sms_object");
-            }
-        }
-    }
-    if sms_center.is_empty() {
         if let Some(db) = db {
-            let keys = smsc_identity_keys(&identity);
-            if !keys.is_empty() {
-                if let Ok(Some(entry)) = db.get_smsc_cache(&keys) {
-                    sms_center = normalize_smsc(&entry.sms_center);
-                    if entry.source == "manual" {
-                        sms_center_is_manual = true;
-                    }
+            if let Some(entry) = smsc_cache_entry_for_identity(db, &identity) {
+                sms_center = normalize_smsc(&entry.sms_center);
+                if entry.source == "manual" {
+                    sms_center_is_manual = true;
                 }
-            }
-        }
-    }
-    if sms_center.is_empty() {
-        sms_center = active_protocol_smsc_fallback(conn, &modem_path).await;
-        if !sms_center.is_empty() {
-            if let Some(db) = db {
-                cache_smsc_for_identity(db, &identity, &sms_center, "protocol");
             }
         }
     }
@@ -2031,10 +2132,10 @@ pub async fn get_sim_info_data_with_cache(
 
     let mut sms_used = None;
     let mut sms_total = None;
-    if let Ok(cpms_output) = send_at_via_modem_command(conn, &modem_path, "AT+CPMS?").await {
-        if let Some((used, total)) = parse_sms_storage_info(&cpms_output) {
-            sms_used = Some(used);
-            sms_total = Some(total);
+    if let Some(db) = db {
+        if let Some(entry) = sms_storage_cache_entry_for_identity(db, &identity) {
+            sms_used = entry.sms_used;
+            sms_total = entry.sms_total;
         }
     }
 
@@ -2729,6 +2830,62 @@ LTE Timing Advance: 'unavailable'"#;
             operator_id: "00101".to_string(),
         };
         assert_eq!(own_number_identity_key(&identity_without_iccid), None);
+    }
+
+    #[test]
+    fn binds_smsc_cache_to_iccid_when_available() {
+        let identity = SimIdentity {
+            iccid: "TEST_ICCID_001".to_string(),
+            imsi: "001010".to_string(),
+            operator_id: "00101".to_string(),
+        };
+        assert_eq!(
+            smsc_identity_keys(&identity),
+            vec!["iccid:TEST_ICCID_001".to_string()]
+        );
+
+        let identity_without_iccid = SimIdentity {
+            iccid: String::new(),
+            imsi: "001010".to_string(),
+            operator_id: "00101".to_string(),
+        };
+        assert_eq!(
+            smsc_identity_keys(&identity_without_iccid),
+            vec!["imsi:001010".to_string(), "operator:00101".to_string()]
+        );
+    }
+
+    #[test]
+    fn empty_sim_detail_cache_counts_as_present_until_iccid_changes() {
+        let db = crate::db::Database::new(std::path::PathBuf::from(":memory:")).unwrap();
+        let identity = SimIdentity {
+            iccid: "TEST_ICCID_001".to_string(),
+            imsi: "001010".to_string(),
+            operator_id: "00101".to_string(),
+        };
+        assert!(sim_details_cache_missing(&db, &identity));
+
+        cache_own_numbers_for_identity(&db, &identity, &[], "empty");
+        cache_smsc_for_identity(&db, &identity, "", "empty");
+        cache_sms_storage_for_identity(&db, &identity, None, None, "empty");
+        assert!(!sim_details_cache_missing(&db, &identity));
+
+        let changed_identity = SimIdentity {
+            iccid: "TEST_ICCID_002".to_string(),
+            ..identity
+        };
+        assert!(sim_details_cache_missing(&db, &changed_identity));
+    }
+
+    #[test]
+    fn sim_detail_refresh_is_not_auto_triggered_without_iccid() {
+        let db = crate::db::Database::new(std::path::PathBuf::from(":memory:")).unwrap();
+        let identity = SimIdentity {
+            iccid: String::new(),
+            imsi: "001010".to_string(),
+            operator_id: "00101".to_string(),
+        };
+        assert!(!sim_details_cache_missing(&db, &identity));
     }
 
     #[test]
@@ -6140,9 +6297,11 @@ pub async fn data_connection_watchdog(
     let mut last_searching_recovery_at: Option<Instant> = None;
     let mut last_data_activation_attempt_at: Option<Instant> = None;
     let mut transition_stuck_count = 0u32;
+    let mut enabled_idle_count = 0u32;
     let mut cellular_problem_active = false;
     let mut data_activation_failure_active = false;
     const TRANSITION_STUCK_THRESHOLD: u32 = 6;
+    const ENABLED_IDLE_RECOVERY_THRESHOLD: u32 = 8;
 
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
@@ -6195,6 +6354,9 @@ pub async fn data_connection_watchdog(
                         searching_count = 0;
                         auto_register_requested_for_search = false;
                     }
+                    if state != 6 {
+                        enabled_idle_count = 0;
+                    }
                     if !data_connection_transition_in_progress(state) {
                         transition_stuck_count = 0;
                     }
@@ -6209,27 +6371,45 @@ pub async fn data_connection_watchdog(
                         } else {
                             "Airplane mode requested, not reconnecting".to_string()
                         }
+                    } else if user_disabled.load(Ordering::SeqCst) {
+                        last_data_activation_attempt_at = None;
+                        enabled_idle_count = 0;
+                        searching_count = 0;
+                        auto_register_requested_for_search = false;
+                        transition_stuck_count = 0;
+                        "User disabled cellular data, not reconnecting".to_string()
                     } else if state == 6 {
-                        match set_modem_enabled(&conn, &modem_path, false).await {
-                            Ok(_) => match set_modem_enabled(&conn, &modem_path, true).await {
-                                Ok(_) => {
-                                    cellular_problem_active = true;
-                                    system_events
-                                        .emit_code(
-                                            system_event_codes::CELLULAR_RADIO_CYCLE_TRIGGERED,
-                                            system_event_severity::WARNING,
-                                            system_event_status::TRIGGERED,
-                                            modem_path.to_string(),
-                                            "Modem enabled but idle, watchdog cycled radio state",
-                                        )
-                                        .await;
-                                    "Modem enabled but idle, cycled radio state".to_string()
-                                }
+                        enabled_idle_count += 1;
+                        if enabled_idle_count < ENABLED_IDLE_RECOVERY_THRESHOLD {
+                            format!(
+                                "Modem enabled but idle, waiting ({}/{})",
+                                enabled_idle_count, ENABLED_IDLE_RECOVERY_THRESHOLD
+                            )
+                        } else {
+                            enabled_idle_count = 0;
+                            match set_modem_enabled(&conn, &modem_path, false).await {
+                                Ok(_) => match set_modem_enabled(&conn, &modem_path, true).await {
+                                    Ok(_) => {
+                                        cellular_problem_active = true;
+                                        system_events
+                                            .emit_code(
+                                                system_event_codes::CELLULAR_RADIO_CYCLE_TRIGGERED,
+                                                system_event_severity::WARNING,
+                                                system_event_status::TRIGGERED,
+                                                modem_path.to_string(),
+                                                "Modem enabled but idle, watchdog cycled radio state",
+                                            )
+                                            .await;
+                                        "Modem enabled but idle, cycled radio state".to_string()
+                                    }
+                                    Err(err) => {
+                                        format!("Modem enabled but idle, re-enable failed: {err}")
+                                    }
+                                },
                                 Err(err) => {
-                                    format!("Modem enabled but idle, re-enable failed: {err}")
+                                    format!("Modem enabled but idle, disable failed: {err}")
                                 }
-                            },
-                            Err(err) => format!("Modem enabled but idle, disable failed: {err}"),
+                            }
                         }
                     } else if state == 7 {
                         searching_count += 1;

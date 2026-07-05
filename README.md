@@ -190,10 +190,32 @@ SimAdmin 是一套面向 Debian 蜂窝 CPE、随身 WiFi、软路由类设备的
 
 ### 👥 贡献者
 
-- [crossgg](https://github.com/crossgg)
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/crossgg">
+        <img src="https://avatars.githubusercontent.com/u/37495419?v=4" width="64" style="border-radius:50%;"/><br>
+        <sub>crossgg</sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/enjin1314">
+        <img src="https://avatars.githubusercontent.com/u/64971822?v=4" width="64" style="border-radius:50%;"/><br>
+        <sub>enjin1314</sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/nkguo">
+        <img src="https://avatars.githubusercontent.com/u/217694652?v=4" width="64" style="border-radius:50%;"/><br>
+        <sub>nkguo</sub>
+      </a>
+    </td>
+  </tr>
+</table>
 
 ### 📦 参考项目
 
 - [project-cpe](https://github.com/1orz/project-cpe)
 - [SmsForwarder](https://github.com/pppscn/SmsForwarder)
 - [ddns-go](https://github.com/jeessy2/ddns-go)
+- [lpac](https://github.com/estkme-group/lpac)

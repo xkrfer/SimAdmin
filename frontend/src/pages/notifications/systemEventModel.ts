@@ -109,6 +109,8 @@ export const SYSTEM_EVENT_TEMPLATE_VARIABLES = [
   { label: '对象', token: '{{对象}}' },
   { label: '消息', token: '{{消息}}' },
   { label: '时间', token: '{{时间}}' },
+  { label: '本机号码', token: '{{本机号码}}' },
+  { label: '运营商', token: '{{运营商}}' },
 ]
 
 export const DEFAULT_SYSTEM_EVENT_TEMPLATE = '系统事件通知\n分类: {{分类}}\n事件: {{事件}}\n等级: {{等级}}\n状态: {{状态}}\n对象: {{对象}}\n消息: {{消息}}\n时间: {{时间}}'

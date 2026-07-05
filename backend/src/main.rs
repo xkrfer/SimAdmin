@@ -481,6 +481,8 @@ async fn main() -> Result<()> {
         .allow_headers(Any);
 
     // 创建统一的应用状态
+    spawn_system_stats_sampler(Arc::clone(&dbus_conn));
+
     let app_state = AppState::new(
         dbus_conn,
         app_db,
@@ -504,6 +506,10 @@ async fn main() -> Result<()> {
         .route("/api/device", get(get_device_info).options(options_handler))
         // ========== SIM 卡接口 ==========
         .route("/api/sim", get(get_sim_info).options(options_handler))
+        .route(
+            "/api/sim/details/refresh",
+            post(refresh_sim_details_handler).options(options_handler),
+        )
         .route(
             "/api/sim/cache",
             post(update_sim_cache_handler).options(options_handler),
@@ -1033,5 +1039,4 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
-
 }

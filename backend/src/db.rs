@@ -179,11 +179,20 @@ pub struct OwnNumberCacheEntry {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmsStorageCacheEntry {
+    pub sms_used: Option<u32>,
+    pub sms_total: Option<u32>,
+    pub source: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EsimProfileCacheEntry {
     pub iccid: String,
     pub name: Option<String>,
     pub provider: Option<String>,
+    pub state: Option<String>,
     pub profile_class: Option<String>,
     pub imsi: Option<String>,
     pub msisdn: Option<String>,
@@ -193,6 +202,21 @@ pub struct EsimProfileCacheEntry {
     pub isdp_aid: Option<String>,
     pub mcc: Option<String>,
     pub mnc: Option<String>,
+    pub disable_allowed: Option<bool>,
+    pub delete_allowed: Option<bool>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EsimEuiccCacheEntry {
+    pub cache_key: String,
+    pub eid: String,
+    pub status: String,
+    pub manufacturer: String,
+    pub memory_total_kb: Option<f64>,
+    pub memory_available_kb: Option<f64>,
+    pub memory_total_customizable: Option<bool>,
+    pub raw: String,
     pub updated_at: String,
 }
 
@@ -510,6 +534,20 @@ impl Database {
         )?;
 
         conn.execute(
+            "CREATE TABLE IF NOT EXISTS sms_storage_cache (
+                identity_key TEXT PRIMARY KEY,
+                iccid TEXT,
+                imsi TEXT,
+                operator_id TEXT,
+                sms_used INTEGER,
+                sms_total INTEGER,
+                source TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+            [],
+        )?;
+
+        conn.execute(
             "CREATE TABLE IF NOT EXISTS esim_profile_cache (
                 iccid TEXT PRIMARY KEY,
                 name TEXT,
@@ -533,6 +571,36 @@ impl Database {
                 [],
             )?;
         }
+        if !table_has_column(&conn, "esim_profile_cache", "state")? {
+            conn.execute("ALTER TABLE esim_profile_cache ADD COLUMN state TEXT", [])?;
+        }
+        if !table_has_column(&conn, "esim_profile_cache", "disable_allowed")? {
+            conn.execute(
+                "ALTER TABLE esim_profile_cache ADD COLUMN disable_allowed INTEGER",
+                [],
+            )?;
+        }
+        if !table_has_column(&conn, "esim_profile_cache", "delete_allowed")? {
+            conn.execute(
+                "ALTER TABLE esim_profile_cache ADD COLUMN delete_allowed INTEGER",
+                [],
+            )?;
+        }
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS esim_euicc_cache (
+                cache_key TEXT PRIMARY KEY,
+                eid TEXT,
+                status TEXT,
+                manufacturer TEXT,
+                memory_total_kb REAL,
+                memory_available_kb REAL,
+                memory_total_customizable INTEGER,
+                raw TEXT,
+                updated_at TEXT NOT NULL
+            )",
+            [],
+        )?;
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS auth_config (
@@ -1515,10 +1583,6 @@ impl Database {
         phone_numbers: &[String],
         source: &str,
     ) -> Result<()> {
-        if phone_numbers.is_empty() {
-            return Ok(());
-        }
-
         let conn = self.conn.lock().unwrap();
         let updated_at = Utc::now().to_rfc3339();
         let phone_numbers = phone_numbers.join("\n");
@@ -1581,6 +1645,76 @@ impl Database {
         Ok(None)
     }
 
+    // ==================== SMS storage cache ====================
+
+    pub fn upsert_sms_storage_cache(
+        &self,
+        identity_key: &str,
+        iccid: &str,
+        imsi: &str,
+        operator_id: &str,
+        sms_used: Option<u32>,
+        sms_total: Option<u32>,
+        source: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let updated_at = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO sms_storage_cache (
+                identity_key, iccid, imsi, operator_id, sms_used, sms_total, source, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(identity_key) DO UPDATE SET
+                iccid = excluded.iccid,
+                imsi = excluded.imsi,
+                operator_id = excluded.operator_id,
+                sms_used = excluded.sms_used,
+                sms_total = COALESCE(excluded.sms_total, sms_storage_cache.sms_total),
+                source = excluded.source,
+                updated_at = excluded.updated_at",
+            params![
+                identity_key,
+                iccid,
+                imsi,
+                operator_id,
+                sms_used,
+                sms_total,
+                source,
+                updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_sms_storage_cache(
+        &self,
+        identity_keys: &[String],
+    ) -> Result<Option<SmsStorageCacheEntry>> {
+        let conn = self.conn.lock().unwrap();
+        for key in identity_keys {
+            let entry = conn
+                .query_row(
+                    "SELECT sms_used, sms_total, source, updated_at
+                     FROM sms_storage_cache
+                     WHERE identity_key = ?1",
+                    params![key],
+                    |row| {
+                        Ok(SmsStorageCacheEntry {
+                            sms_used: row.get(0)?,
+                            sms_total: row.get(1)?,
+                            source: row.get(2)?,
+                            updated_at: row.get(3)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if entry.is_some() {
+                return Ok(entry);
+            }
+        }
+        Ok(None)
+    }
+
     // ==================== eSIM Profile cache ====================
 
     pub fn upsert_esim_profile_cache(&self, entry: &EsimProfileCacheEntry) -> Result<()> {
@@ -1592,6 +1726,7 @@ impl Database {
         let has_profile_data = [
             entry.name.as_deref(),
             entry.provider.as_deref(),
+            entry.state.as_deref(),
             entry.profile_class.as_deref(),
             entry.imsi.as_deref(),
             entry.msisdn.as_deref(),
@@ -1614,13 +1749,14 @@ impl Database {
         let updated_at = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO esim_profile_cache (
-                iccid, name, provider, profile_class, imsi, msisdn, smsc, smdp,
-                matching_id, isdp_aid, mcc, mnc, updated_at
+                iccid, name, provider, state, profile_class, imsi, msisdn, smsc, smdp,
+                matching_id, isdp_aid, mcc, mnc, disable_allowed, delete_allowed, updated_at
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(iccid) DO UPDATE SET
                 name = COALESCE(excluded.name, esim_profile_cache.name),
                 provider = COALESCE(excluded.provider, esim_profile_cache.provider),
+                state = COALESCE(excluded.state, esim_profile_cache.state),
                 profile_class = COALESCE(excluded.profile_class, esim_profile_cache.profile_class),
                 imsi = COALESCE(excluded.imsi, esim_profile_cache.imsi),
                 msisdn = COALESCE(excluded.msisdn, esim_profile_cache.msisdn),
@@ -1630,11 +1766,14 @@ impl Database {
                 isdp_aid = COALESCE(excluded.isdp_aid, esim_profile_cache.isdp_aid),
                 mcc = COALESCE(excluded.mcc, esim_profile_cache.mcc),
                 mnc = COALESCE(excluded.mnc, esim_profile_cache.mnc),
+                disable_allowed = COALESCE(excluded.disable_allowed, esim_profile_cache.disable_allowed),
+                delete_allowed = COALESCE(excluded.delete_allowed, esim_profile_cache.delete_allowed),
                 updated_at = excluded.updated_at",
             params![
                 &iccid,
                 non_empty_option(entry.name.as_deref()),
                 non_empty_option(entry.provider.as_deref()),
+                non_empty_option(entry.state.as_deref()),
                 non_empty_option(entry.profile_class.as_deref()),
                 non_empty_option(entry.imsi.as_deref()),
                 non_empty_option(entry.msisdn.as_deref()),
@@ -1644,6 +1783,8 @@ impl Database {
                 non_empty_option(entry.isdp_aid.as_deref()),
                 non_empty_option(entry.mcc.as_deref()),
                 non_empty_option(entry.mnc.as_deref()),
+                entry.disable_allowed,
+                entry.delete_allowed,
                 updated_at
             ],
         )?;
@@ -1658,8 +1799,8 @@ impl Database {
 
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT iccid, name, provider, profile_class, imsi, msisdn, smsc, smdp,
-                    matching_id, isdp_aid, mcc, mnc, updated_at
+            "SELECT iccid, name, provider, state, profile_class, imsi, msisdn, smsc, smdp,
+                    matching_id, isdp_aid, mcc, mnc, disable_allowed, delete_allowed, updated_at
              FROM esim_profile_cache
              WHERE iccid = ?1",
             params![&iccid],
@@ -1668,16 +1809,19 @@ impl Database {
                     iccid: row.get(0)?,
                     name: row.get(1)?,
                     provider: row.get(2)?,
-                    profile_class: row.get(3)?,
-                    imsi: row.get(4)?,
-                    msisdn: row.get(5)?,
-                    smsc: row.get(6)?,
-                    smdp: row.get(7)?,
-                    matching_id: row.get(8)?,
-                    isdp_aid: row.get(9)?,
-                    mcc: row.get(10)?,
-                    mnc: row.get(11)?,
-                    updated_at: row.get(12)?,
+                    state: row.get(3)?,
+                    profile_class: row.get(4)?,
+                    imsi: row.get(5)?,
+                    msisdn: row.get(6)?,
+                    smsc: row.get(7)?,
+                    smdp: row.get(8)?,
+                    matching_id: row.get(9)?,
+                    isdp_aid: row.get(10)?,
+                    mcc: row.get(11)?,
+                    mnc: row.get(12)?,
+                    disable_allowed: row.get(13)?,
+                    delete_allowed: row.get(14)?,
+                    updated_at: row.get(15)?,
                 })
             },
         )
@@ -1687,26 +1831,29 @@ impl Database {
     pub fn list_esim_profile_cache(&self) -> Result<Vec<EsimProfileCacheEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(
-            "SELECT iccid, name, provider, profile_class, imsi, msisdn, smsc, smdp,
-                    matching_id, isdp_aid, mcc, mnc, updated_at
+            "SELECT iccid, name, provider, state, profile_class, imsi, msisdn, smsc, smdp,
+                    matching_id, isdp_aid, mcc, mnc, disable_allowed, delete_allowed, updated_at
              FROM esim_profile_cache
-             ORDER BY updated_at DESC, iccid ASC",
+             ORDER BY iccid ASC",
         )?;
         let rows = statement.query_map([], |row| {
             Ok(EsimProfileCacheEntry {
                 iccid: row.get(0)?,
                 name: row.get(1)?,
                 provider: row.get(2)?,
-                profile_class: row.get(3)?,
-                imsi: row.get(4)?,
-                msisdn: row.get(5)?,
-                smsc: row.get(6)?,
-                smdp: row.get(7)?,
-                matching_id: row.get(8)?,
-                isdp_aid: row.get(9)?,
-                mcc: row.get(10)?,
-                mnc: row.get(11)?,
-                updated_at: row.get(12)?,
+                state: row.get(3)?,
+                profile_class: row.get(4)?,
+                imsi: row.get(5)?,
+                msisdn: row.get(6)?,
+                smsc: row.get(7)?,
+                smdp: row.get(8)?,
+                matching_id: row.get(9)?,
+                isdp_aid: row.get(10)?,
+                mcc: row.get(11)?,
+                mnc: row.get(12)?,
+                disable_allowed: row.get(13)?,
+                delete_allowed: row.get(14)?,
+                updated_at: row.get(15)?,
             })
         })?;
 
@@ -1721,6 +1868,101 @@ impl Database {
             params![&iccid],
         )?;
         Ok(())
+    }
+
+    // ==================== eUICC cache ====================
+
+    pub fn upsert_esim_euicc_cache(&self, entry: &EsimEuiccCacheEntry) -> Result<()> {
+        let cache_key = if entry.cache_key.trim().is_empty() {
+            if entry.eid.trim().is_empty() {
+                "default".to_string()
+            } else {
+                format!("eid:{}", entry.eid.trim())
+            }
+        } else {
+            entry.cache_key.trim().to_string()
+        };
+        let conn = self.conn.lock().unwrap();
+        let updated_at = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO esim_euicc_cache (
+                cache_key, eid, status, manufacturer, memory_total_kb,
+                memory_available_kb, memory_total_customizable, raw, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(cache_key) DO UPDATE SET
+                eid = excluded.eid,
+                status = excluded.status,
+                manufacturer = excluded.manufacturer,
+                memory_total_kb = excluded.memory_total_kb,
+                memory_available_kb = excluded.memory_available_kb,
+                memory_total_customizable = excluded.memory_total_customizable,
+                raw = excluded.raw,
+                updated_at = excluded.updated_at",
+            params![
+                cache_key,
+                entry.eid,
+                entry.status,
+                entry.manufacturer,
+                entry.memory_total_kb,
+                entry.memory_available_kb,
+                entry.memory_total_customizable,
+                entry.raw,
+                updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_esim_euicc_cache(&self, cache_key: &str) -> Result<Option<EsimEuiccCacheEntry>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT cache_key, eid, status, manufacturer, memory_total_kb,
+                    memory_available_kb, memory_total_customizable, raw, updated_at
+             FROM esim_euicc_cache
+             WHERE cache_key = ?1",
+            params![cache_key],
+            |row| {
+                Ok(EsimEuiccCacheEntry {
+                    cache_key: row.get(0)?,
+                    eid: row.get(1)?,
+                    status: row.get(2)?,
+                    manufacturer: row.get(3)?,
+                    memory_total_kb: row.get(4)?,
+                    memory_available_kb: row.get(5)?,
+                    memory_total_customizable: row.get(6)?,
+                    raw: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+    }
+
+    pub fn latest_esim_euicc_cache(&self) -> Result<Option<EsimEuiccCacheEntry>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT cache_key, eid, status, manufacturer, memory_total_kb,
+                    memory_available_kb, memory_total_customizable, raw, updated_at
+             FROM esim_euicc_cache
+             ORDER BY updated_at DESC
+             LIMIT 1",
+            [],
+            |row| {
+                Ok(EsimEuiccCacheEntry {
+                    cache_key: row.get(0)?,
+                    eid: row.get(1)?,
+                    status: row.get(2)?,
+                    manufacturer: row.get(3)?,
+                    memory_total_kb: row.get(4)?,
+                    memory_available_kb: row.get(5)?,
+                    memory_total_customizable: row.get(6)?,
+                    raw: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            },
+        )
+        .optional()
     }
 
     // ==================== 通话记录相关方法 ====================
@@ -2039,5 +2281,119 @@ impl Database {
         }
 
         Ok(deleted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> Database {
+        Database::new(PathBuf::from(":memory:")).unwrap()
+    }
+
+    #[test]
+    fn own_number_cache_allows_empty_result() {
+        let db = test_db();
+
+        db.upsert_own_number_cache(
+            "iccid:TEST_ICCID_001",
+            "TEST_ICCID_001",
+            "001010",
+            "00101",
+            &[],
+            "empty",
+        )
+        .unwrap();
+
+        let entry = db
+            .get_own_number_cache(&["iccid:TEST_ICCID_001".to_string()])
+            .unwrap()
+            .unwrap();
+        assert!(entry.phone_numbers.is_empty());
+        assert_eq!(entry.source, "empty");
+        assert!(!entry.updated_at.is_empty());
+    }
+
+    #[test]
+    fn sms_storage_cache_allows_empty_result() {
+        let db = test_db();
+
+        db.upsert_sms_storage_cache(
+            "iccid:TEST_ICCID_001",
+            "TEST_ICCID_001",
+            "001010",
+            "00101",
+            None,
+            None,
+            "empty",
+        )
+        .unwrap();
+
+        let entry = db
+            .get_sms_storage_cache(&["iccid:TEST_ICCID_001".to_string()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.sms_used, None);
+        assert_eq!(entry.sms_total, None);
+        assert_eq!(entry.source, "empty");
+        assert!(!entry.updated_at.is_empty());
+    }
+
+    #[test]
+    fn esim_profile_cache_persists_state_permissions_and_updated_at() {
+        let db = test_db();
+        db.upsert_esim_profile_cache(&EsimProfileCacheEntry {
+            iccid: "8901000000000000001".to_string(),
+            name: Some("Profile A".to_string()),
+            provider: Some("Provider".to_string()),
+            state: Some("enabled".to_string()),
+            disable_allowed: Some(false),
+            delete_allowed: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let entry = db
+            .get_esim_profile_cache("8901000000000000001")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.state.as_deref(), Some("enabled"));
+        assert_eq!(entry.disable_allowed, Some(false));
+        assert_eq!(entry.delete_allowed, Some(true));
+        assert!(!entry.updated_at.is_empty());
+
+        let listed = db.list_esim_profile_cache().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].state.as_deref(), Some("enabled"));
+        assert_eq!(listed[0].disable_allowed, Some(false));
+        assert_eq!(listed[0].delete_allowed, Some(true));
+    }
+
+    #[test]
+    fn esim_euicc_cache_persists_latest_snapshot() {
+        let db = test_db();
+        db.upsert_esim_euicc_cache(&EsimEuiccCacheEntry {
+            cache_key: "eid:EID001".to_string(),
+            eid: "EID001".to_string(),
+            status: "ready".to_string(),
+            manufacturer: "Test".to_string(),
+            memory_total_kb: Some(1024.0),
+            memory_available_kb: Some(512.0),
+            memory_total_customizable: Some(true),
+            raw: "{}".to_string(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+
+        let by_key = db.get_esim_euicc_cache("eid:EID001").unwrap().unwrap();
+        assert_eq!(by_key.eid, "EID001");
+        assert_eq!(by_key.memory_total_kb, Some(1024.0));
+        assert_eq!(by_key.memory_available_kb, Some(512.0));
+        assert_eq!(by_key.memory_total_customizable, Some(true));
+        assert!(!by_key.updated_at.is_empty());
+
+        let latest = db.latest_esim_euicc_cache().unwrap().unwrap();
+        assert_eq!(latest.cache_key, "eid:EID001");
     }
 }

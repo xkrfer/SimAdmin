@@ -1,4 +1,4 @@
-import { type ChangeEvent, useRef } from 'react'
+import { type ChangeEvent, type MutableRefObject, useRef } from 'react'
 import {
   Accordion,
   AccordionDetails,
@@ -32,11 +32,13 @@ import type {
   NotificationRule,
 } from '../../api/current'
 import {
+  DEFAULT_TITLE_TEMPLATES,
   DEFAULT_TEMPLATES,
   EVENT_TYPES,
   MATCHER_OPERATORS,
   MATCH_FIELDS,
   TEMPLATE_VARIABLES,
+  TITLE_TEMPLATE_VARIABLES,
   WEEKDAYS,
   createQuietSchedule,
   eventLabel,
@@ -53,6 +55,24 @@ const EVENT_ICONS: Record<NotificationEventType, typeof Sms> = {
   device_status: QueryStats,
   automation: AutoMode,
 }
+
+const ruleTextFieldSx = {
+  '& .MuiInputBase-input': {
+    fontSize: '14px',
+  },
+  '& .MuiInputBase-input::placeholder': {
+    fontSize: '14px',
+  },
+  '& .MuiInputLabel-root': {
+    fontSize: '14px',
+  },
+  '& .MuiSelect-select': {
+    fontSize: '14px',
+  },
+  '& .MuiFormControlLabel-label': {
+    fontSize: '14px',
+  },
+} as const
 
 type NotificationRulesTabProps = {
   config: NotificationConfig
@@ -75,11 +95,17 @@ export default function NotificationRulesTab({
   onPatchRule,
   onSave,
 }: NotificationRulesTabProps) {
-  const textareaRefs = useRef<Record<string, HTMLTextAreaElement | HTMLInputElement | null>>({})
+  const titleInputRefs = useRef<Record<string, HTMLTextAreaElement | HTMLInputElement | null>>({})
+  const bodyTextareaRefs = useRef<Record<string, HTMLTextAreaElement | HTMLInputElement | null>>({})
 
-  const insertToken = (ruleId: string, template: string, token: string) => {
+  const insertToken = (
+    refs: MutableRefObject<Record<string, HTMLTextAreaElement | HTMLInputElement | null>>,
+    ruleId: string,
+    template: string,
+    token: string,
+  ) => {
     const currentTemplate = template || ''
-    const el = textareaRefs.current[ruleId]
+    const el = refs.current[ruleId]
     if (!el) {
       return `${currentTemplate}${currentTemplate ? '\n' : ''}${token}`
     }
@@ -187,7 +213,7 @@ export default function NotificationRulesTab({
   )
 
   return (
-    <Card sx={{ height: 'calc(100vh - 220px)', minHeight: 520 }}>
+    <Card sx={{ height: 'calc(100vh - 220px)', minHeight: 520, ...ruleTextFieldSx }}>
       <CardContent sx={{ height: '100%', p: 0, '&:last-child': { pb: 0 } }}>
         <Box display="flex" height="100%">
           {!isCompact && (
@@ -428,6 +454,33 @@ export default function NotificationRulesTab({
 
                     <Box mt={2}>
                       <Box display="flex" alignItems="center" gap={1} mb={1} flexWrap="wrap">
+                        <Typography variant="subtitle2">标题模板</Typography>
+                        {TITLE_TEMPLATE_VARIABLES[rule.type].map((variable) => (
+                          <Chip
+                            key={variable.token}
+                            size="small"
+                            label={variable.label}
+                            variant="outlined"
+                            onClick={() => {
+                              const nextTemplate = insertToken(titleInputRefs, rule.id, rule.title_template, variable.token)
+                              onPatchRule(rule.id, { title_template: nextTemplate })
+                            }}
+                          />
+                        ))}
+                      </Box>
+                      <TextField
+                        fullWidth
+                        value={rule.title_template}
+                        inputRef={(el) => {
+                          titleInputRefs.current[rule.id] = el
+                        }}
+                        onChange={(event: ChangeEvent<HTMLInputElement>) => onPatchRule(rule.id, { title_template: event.target.value })}
+                      />
+                      <Button size="small" sx={{ mt: 1 }} onClick={() => onPatchRule(rule.id, { title_template: DEFAULT_TITLE_TEMPLATES[rule.type] })}>恢复默认标题</Button>
+                    </Box>
+
+                    <Box mt={2}>
+                      <Box display="flex" alignItems="center" gap={1} mb={1} flexWrap="wrap">
                         <Typography variant="subtitle2">文本模板</Typography>
                         {TEMPLATE_VARIABLES[rule.type].map((variable) => (
                           <Chip
@@ -436,7 +489,7 @@ export default function NotificationRulesTab({
                             label={variable.label}
                             variant="outlined"
                             onClick={() => {
-                              const nextTemplate = insertToken(rule.id, rule.template, variable.token)
+                              const nextTemplate = insertToken(bodyTextareaRefs, rule.id, rule.template, variable.token)
                               onPatchRule(rule.id, { template: nextTemplate })
                             }}
                           />
@@ -448,7 +501,7 @@ export default function NotificationRulesTab({
                         minRows={5}
                         value={rule.template}
                         inputRef={(el) => {
-                          textareaRefs.current[rule.id] = el
+                          bodyTextareaRefs.current[rule.id] = el
                         }}
                         onChange={(event: ChangeEvent<HTMLInputElement>) => onPatchRule(rule.id, { template: event.target.value })}
                       />

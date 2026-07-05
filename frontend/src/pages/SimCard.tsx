@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import {
   Box,
   Typography,
@@ -24,6 +24,7 @@ import {
   Edit,
   Check,
   Close,
+  Refresh,
   Language as LanguageIcon,
   Lock as LockIcon,
   Storage as StorageIcon,
@@ -187,6 +188,8 @@ function SimBasicInfo() {
   const [smscInput, setSmscInput] = useState('')
   const [savingPhone, setSavingPhone] = useState(false)
   const [savingSmsc, setSavingSmsc] = useState(false)
+  const [detailsRefreshing, setDetailsRefreshing] = useState(false)
+  const autoDetailsRefreshIccidRef = useRef<string | null>(null)
 
   const isPhoneEmpty = !simInfo?.phone_numbers?.length
   const isSmscEmpty = !simInfo?.sms_center
@@ -203,16 +206,49 @@ function SimBasicInfo() {
 
   const validatePhoneStr = (val: string) => /^\+?\d+$/.test(val.trim())
 
-  const loadData = async () => {
-    setLoading(true)
+  const scheduleDetailsRefetch = () => {
+    window.setTimeout(() => {
+      void loadData(false)
+    }, 2500)
+  }
+
+  const loadData = async (showLoading = true) => {
+    if (showLoading) setLoading(true)
     setError(null)
     try {
       const simRes = await api.getSimInfo()
-      if (simRes.data) setSimInfo(simRes.data)
+      if (simRes.data) {
+        setSimInfo(simRes.data)
+        const data = simRes.data
+        const missingSlowFields =
+          data.present && (!data.phone_numbers?.length || !data.sms_center || data.sms_total === undefined)
+        if (missingSlowFields && data.iccid && autoDetailsRefreshIccidRef.current !== data.iccid) {
+          autoDetailsRefreshIccidRef.current = data.iccid
+          setDetailsRefreshing(true)
+          void api.refreshSimDetails()
+            .then(scheduleDetailsRefetch)
+            .catch(() => {})
+            .finally(() => setDetailsRefreshing(false))
+        }
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
-      setLoading(false)
+      if (showLoading) setLoading(false)
+    }
+  }
+
+  const handleRefreshDetails = async () => {
+    autoDetailsRefreshIccidRef.current = null
+    setDetailsRefreshing(true)
+    try {
+      await api.refreshSimDetails()
+      showMsg('SIM 慢字段刷新已开始', 'success')
+      scheduleDetailsRefetch()
+    } catch (err) {
+      showMsg(err instanceof Error ? err.message : String(err), 'error')
+    } finally {
+      setDetailsRefreshing(false)
     }
   }
 
@@ -262,7 +298,7 @@ function SimBasicInfo() {
 
   useEffect(() => {
     void loadData()
-  }, [])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   if (loading) {
     return (
@@ -286,15 +322,28 @@ function SimBasicInfo() {
                 title="SIM 卡基本标识"
                 titleTypographyProps={{ variant: 'subtitle1', fontWeight: 600 }}
                 action={
-                  <Tooltip title={showSensitive ? '隐藏敏感信息' : '显示完整信息'}>
-                    <IconButton
-                      size="small"
-                      onClick={() => setShowSensitive((value) => !value)}
-                      color="primary"
-                    >
-                      {showSensitive ? <VisibilityOff fontSize="small" /> : <Visibility fontSize="small" />}
-                    </IconButton>
-                  </Tooltip>
+                  <Box display="flex" alignItems="center" gap={0.5}>
+                    <Tooltip title="刷新 SIM 详细信息">
+                      <span>
+                        <IconButton
+                          size="small"
+                          onClick={() => void handleRefreshDetails()}
+                          disabled={detailsRefreshing || !simInfo?.present}
+                        >
+                          {detailsRefreshing ? <CircularProgress size={16} /> : <Refresh fontSize="small" />}
+                        </IconButton>
+                      </span>
+                    </Tooltip>
+                    <Tooltip title={showSensitive ? '隐藏敏感信息' : '显示完整信息'}>
+                      <IconButton
+                        size="small"
+                        onClick={() => setShowSensitive((value) => !value)}
+                        color="primary"
+                      >
+                        {showSensitive ? <VisibilityOff fontSize="small" /> : <Visibility fontSize="small" />}
+                      </IconButton>
+                    </Tooltip>
+                  </Box>
                 }
               />
               <CardContent sx={{ pt: 0 }}>

@@ -1,9 +1,9 @@
 use crate::config::{
-    BarkConfig, ConfigManager, DingtalkAppConfig, DingtalkRobotConfig, FeishuRobotConfig,
-    LegacyNotificationConfig, MatcherOperator, MessageChannelConfig, NotificationChannel,
-    NotificationChannelInstance, NotificationConfig, NotificationEventType, NotificationRule,
-    PushPlusConfig, QuietHoursSchedule, TelegramConfig, WebhookConfig, WecomAppConfig,
-    WecomRobotConfig,
+    BarkConfig, ConfigManager, DingtalkAppConfig, DingtalkRobotConfig, EmailConfig,
+    FeishuRobotConfig, LegacyNotificationConfig, MatcherOperator, MessageChannelConfig,
+    NotificationChannel, NotificationChannelInstance, NotificationConfig, NotificationEventType,
+    NotificationRule, PushPlusConfig, QuietHoursSchedule, ServerChan3Config, TelegramConfig,
+    WebhookConfig, WecomAppConfig, WecomRobotConfig,
 };
 use crate::db::{
     CallRecord, Database, NewNotificationQueueItem, NotificationQueueEntry, SmsMessage,
@@ -17,11 +17,15 @@ use base64::{engine::general_purpose, Engine as _};
 use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, FixedOffset, NaiveDateTime, Timelike, Utc,
 };
+use lettre::message::{Mailbox, SinglePart};
+use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::client::{Tls, TlsParameters};
+use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use reqwest::{Client, StatusCode};
 use ring::hmac;
 use serde::de::DeserializeOwned;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -62,7 +66,7 @@ pub struct NotificationFanoutResult {
 }
 
 #[derive(Default)]
-struct SmsTemplateContext {
+struct NotificationTemplateContext {
     own_number: String,
     carrier: String,
 }
@@ -93,23 +97,23 @@ pub struct AutomationEvent {
 enum NotificationEvent<'a> {
     Sms {
         message: &'a SmsMessage,
-        context: &'a SmsTemplateContext,
+        context: &'a NotificationTemplateContext,
     },
-    Ddns(&'a DdnsEvent),
-    VersionUpdate(&'a VersionUpdateEvent),
-    SystemEvent(&'a SystemEvent),
-    DeviceStatus(&'a DeviceStatusReport),
-    Automation(&'a AutomationEvent, String),
+    Ddns(&'a DdnsEvent, &'a NotificationTemplateContext),
+    VersionUpdate(&'a VersionUpdateEvent, &'a NotificationTemplateContext),
+    SystemEvent(&'a SystemEvent, &'a NotificationTemplateContext),
+    DeviceStatus(&'a DeviceStatusReport, &'a NotificationTemplateContext),
+    Automation(&'a AutomationEvent, &'a NotificationTemplateContext),
 }
 
 impl NotificationEvent<'_> {
     fn event_type(&self) -> NotificationEventType {
         match self {
             NotificationEvent::Sms { .. } => NotificationEventType::Sms,
-            NotificationEvent::Ddns(_) => NotificationEventType::Ddns,
-            NotificationEvent::VersionUpdate(_) => NotificationEventType::VersionUpdate,
-            NotificationEvent::SystemEvent(_) => NotificationEventType::SystemEvent,
-            NotificationEvent::DeviceStatus(_) => NotificationEventType::DeviceStatus,
+            NotificationEvent::Ddns(..) => NotificationEventType::Ddns,
+            NotificationEvent::VersionUpdate(..) => NotificationEventType::VersionUpdate,
+            NotificationEvent::SystemEvent(..) => NotificationEventType::SystemEvent,
+            NotificationEvent::DeviceStatus(..) => NotificationEventType::DeviceStatus,
             NotificationEvent::Automation(..) => NotificationEventType::Automation,
         }
     }
@@ -117,12 +121,12 @@ impl NotificationEvent<'_> {
     fn title(&self) -> String {
         match self {
             NotificationEvent::Sms { .. } => "SimAdmin 短信通知".to_string(),
-            NotificationEvent::Ddns(_) => "SimAdmin DDNS 通知".to_string(),
-            NotificationEvent::VersionUpdate(_) => "SimAdmin 版本更新".to_string(),
-            NotificationEvent::SystemEvent(event) => {
+            NotificationEvent::Ddns(..) => "SimAdmin DDNS 通知".to_string(),
+            NotificationEvent::VersionUpdate(..) => "SimAdmin 版本更新".to_string(),
+            NotificationEvent::SystemEvent(event, _) => {
                 format!("SimAdmin 系统事件 - {}", event.event_label)
             }
-            NotificationEvent::DeviceStatus(_) => "SimAdmin 设备状态".to_string(),
+            NotificationEvent::DeviceStatus(..) => "SimAdmin 设备状态".to_string(),
             NotificationEvent::Automation(event, _) => {
                 format!("SimAdmin 自动化 - {}", event.task_name)
             }
@@ -134,21 +138,20 @@ impl NotificationEvent<'_> {
             NotificationEvent::Sms { message, .. } => {
                 compact_summary(&format!("[{}] {}", message.phone_number, message.content))
             }
-            NotificationEvent::Ddns(event) => compact_summary(&format!(
+            NotificationEvent::Ddns(event, _) => compact_summary(&format!(
                 "{} {} {}",
                 event.domains.join(", "),
                 event.status,
                 event.message
             )),
-            NotificationEvent::VersionUpdate(event) => compact_summary(&format!(
-                "{} {} {}",
-                event.version, event.asset_name, event.commit
-            )),
-            NotificationEvent::SystemEvent(event) => compact_summary(&format!(
+            NotificationEvent::VersionUpdate(event, _) => {
+                compact_summary(&format!("{} {}", event.version, event.asset_name))
+            }
+            NotificationEvent::SystemEvent(event, _) => compact_summary(&format!(
                 "{} {} {}",
                 event.event_label, event.status_label, event.message
             )),
-            NotificationEvent::DeviceStatus(_) => "设备状态定时报表".to_string(),
+            NotificationEvent::DeviceStatus(..) => "设备状态定时报表".to_string(),
             NotificationEvent::Automation(event, _) => {
                 compact_summary(&format!("[{}] {}", event.task_name, event.message))
             }
@@ -161,6 +164,7 @@ impl NotificationEvent<'_> {
                 "phone_number" => message.phone_number.clone(),
                 "content" => message.content.clone(),
                 "own_number" => context.own_number.clone(),
+                "carrier" | "operator" => context.carrier.clone(),
                 "verification_code" => {
                     extract_verification_code(&message.content).unwrap_or_default()
                 }
@@ -168,7 +172,7 @@ impl NotificationEvent<'_> {
                 "status" => message.status.clone(),
                 _ => self.summary(),
             },
-            NotificationEvent::Ddns(event) => match field {
+            NotificationEvent::Ddns(event, context) => match field {
                 "domains" | "domain" => event.domains.join(", "),
                 "provider" => event.provider.clone(),
                 "record_type" => event.record_type.clone(),
@@ -177,16 +181,19 @@ impl NotificationEvent<'_> {
                 "new_ip" => event.new_ip.clone().unwrap_or_default(),
                 "old_ip" => event.old_ip.clone().unwrap_or_default(),
                 "failure_count" => event.failure_count.to_string(),
+                "own_number" => context.own_number.clone(),
+                "carrier" | "operator" => context.carrier.clone(),
                 _ => self.summary(),
             },
-            NotificationEvent::VersionUpdate(event) => match field {
+            NotificationEvent::VersionUpdate(event, context) => match field {
                 "asset_name" => event.asset_name.clone(),
                 "version" => event.version.clone(),
-                "commit" => event.commit.clone(),
                 "build_time" => event.build_time.clone(),
+                "own_number" => common_own_number(context, &event.own_number).to_string(),
+                "carrier" | "operator" => context.carrier.clone(),
                 _ => self.summary(),
             },
-            NotificationEvent::SystemEvent(event) => match field {
+            NotificationEvent::SystemEvent(event, context) => match field {
                 "category" => event.category.clone(),
                 "category_label" => event.category_label.clone(),
                 "event_code" => event.event_code.clone(),
@@ -197,21 +204,26 @@ impl NotificationEvent<'_> {
                 "status_label" => event.status_label.clone(),
                 "entity" => event.entity.clone(),
                 "message" => event.message.clone(),
+                "own_number" => context.own_number.clone(),
+                "carrier" | "operator" => context.carrier.clone(),
                 _ => self.summary(),
             },
-            NotificationEvent::DeviceStatus(report) => match field {
+            NotificationEvent::DeviceStatus(report, context) => match field {
                 "status_content" | "content" => report.text(),
                 "timestamp" => report.timestamp.clone(),
+                "own_number" => context.own_number.clone(),
+                "carrier" | "operator" => context.carrier.clone(),
                 _ => self.summary(),
             },
-            NotificationEvent::Automation(event, own_number) => match field {
+            NotificationEvent::Automation(event, context) => match field {
                 "task_id" => event.task_id.clone(),
                 "task_name" => event.task_name.clone(),
                 "task_type" => event.task_type.clone(),
                 "status" => event.status.clone(),
                 "message" => event.message.clone(),
                 "timestamp" => event.timestamp.clone(),
-                "own_number" => own_number.clone(),
+                "own_number" => context.own_number.clone(),
+                "carrier" | "operator" => context.carrier.clone(),
                 _ => self.summary(),
             },
         }
@@ -227,19 +239,45 @@ impl NotificationEvent<'_> {
             NotificationEvent::Sms { message, context } => {
                 render_sms_template(&template, message, context, false)
             }
-            NotificationEvent::Ddns(event) => render_ddns_template(&template, event, false),
-            NotificationEvent::VersionUpdate(event) => {
-                render_version_update_template(&template, event, false)
+            NotificationEvent::Ddns(event, context) => {
+                render_ddns_template(&template, event, context, false)
             }
-            NotificationEvent::SystemEvent(event) => {
-                render_system_event_template(&template, event, false)
+            NotificationEvent::VersionUpdate(event, context) => {
+                render_version_update_template(&template, event, context, false)
             }
-            NotificationEvent::DeviceStatus(report) => {
-                render_device_status_template(&template, report, false)
+            NotificationEvent::SystemEvent(event, context) => {
+                render_system_event_template(&template, event, context, false)
             }
-            NotificationEvent::Automation(event, own_number) => {
-                render_automation_template(&template, event, own_number, false)
+            NotificationEvent::DeviceStatus(report, context) => {
+                render_device_status_template(&template, report, context, false)
             }
+            NotificationEvent::Automation(event, context) => {
+                render_automation_template(&template, event, context, false)
+            }
+        }
+    }
+
+    fn render_title(&self, title_template: &str) -> String {
+        let use_default = title_template.trim().is_empty();
+        let default_template = crate::config::default_rule_title_template(self.event_type());
+        if let NotificationEvent::Sms { message, .. } = self {
+            if (use_default || title_template.trim() == default_template)
+                && extract_verification_code(&message.content).is_none()
+            {
+                return message.phone_number.clone();
+            }
+        }
+
+        let template = if use_default {
+            default_template
+        } else {
+            title_template.to_string()
+        };
+        let title = self.render(&template);
+        if title.trim().is_empty() {
+            self.title()
+        } else {
+            title
         }
     }
 }
@@ -276,22 +314,24 @@ impl NotificationSender {
             .unwrap_or_default()
     }
 
-    async fn sms_template_context(&self) -> SmsTemplateContext {
+    async fn notification_template_context(&self) -> NotificationTemplateContext {
         let own_number = self.get_own_number().await;
 
-        let carrier =
-            crate::modem_manager::get_network_info_data(self.dbus_conn.as_ref())
-                .await
-                .ok()
-                .map(|net| net.operator_name)
-                .unwrap_or_default();
+        let carrier = crate::modem_manager::get_network_info_data(self.dbus_conn.as_ref())
+            .await
+            .ok()
+            .map(|net| net.operator_name)
+            .unwrap_or_default();
 
-        SmsTemplateContext { own_number, carrier }
+        NotificationTemplateContext {
+            own_number,
+            carrier,
+        }
     }
 
     /// Forward an incoming SMS to all enabled channels.
     pub async fn forward_sms(&self, message: &SmsMessage) -> Result<(), String> {
-        let context = self.sms_template_context().await;
+        let context = self.notification_template_context().await;
         let event = NotificationEvent::Sms {
             message,
             context: &context,
@@ -343,7 +383,8 @@ impl NotificationSender {
 
     /// Forward a DDNS update/failure event to all enabled channels.
     pub async fn forward_ddns_event(&self, event: &DdnsEvent) -> Result<(), String> {
-        let event = NotificationEvent::Ddns(event);
+        let context = self.notification_template_context().await;
+        let event = NotificationEvent::Ddns(event, &context);
         let result = self.route_event(&event).await;
 
         if result.errors.is_empty() || result.delivered {
@@ -355,8 +396,8 @@ impl NotificationSender {
 
     /// Forward an automation task execution event to all enabled channels.
     pub async fn forward_automation_event(&self, event: &AutomationEvent) -> Result<(), String> {
-        let own_number = self.get_own_number().await;
-        let event = NotificationEvent::Automation(event, own_number);
+        let context = self.notification_template_context().await;
+        let event = NotificationEvent::Automation(event, &context);
         let result = self.route_event(&event).await;
 
         if result.errors.is_empty() || result.delivered {
@@ -397,7 +438,8 @@ impl NotificationSender {
         &self,
         event: &VersionUpdateEvent,
     ) -> Result<NotificationFanoutResult, String> {
-        let event = NotificationEvent::VersionUpdate(event);
+        let context = self.notification_template_context().await;
+        let event = NotificationEvent::VersionUpdate(event, &context);
         let result = self.route_event(&event).await;
 
         if result.delivered || result.errors.is_empty() {
@@ -411,7 +453,8 @@ impl NotificationSender {
     }
 
     pub async fn forward_system_event(&self, event: &SystemEvent) -> Result<(), String> {
-        let event = NotificationEvent::SystemEvent(event);
+        let context = self.notification_template_context().await;
+        let event = NotificationEvent::SystemEvent(event, &context);
         let result = self.route_event(&event).await;
 
         if result.errors.is_empty() || result.delivered {
@@ -426,7 +469,8 @@ impl NotificationSender {
         rule_id: &str,
         report: &DeviceStatusReport,
     ) -> Result<(), String> {
-        let event = NotificationEvent::DeviceStatus(report);
+        let context = self.notification_template_context().await;
+        let event = NotificationEvent::DeviceStatus(report, &context);
         let result = self.route_event_for_rule(&event, Some(rule_id)).await;
 
         if result.errors.is_empty() || result.delivered {
@@ -560,7 +604,7 @@ impl NotificationSender {
                     continue;
                 }
 
-                let title = event.title();
+                let title = event.render_title(&rule.title_template);
                 match self
                     .send_text_to_channel_with_queue(
                         event,
@@ -704,7 +748,8 @@ impl NotificationSender {
 
     pub fn ddns_event_blocked_by_failure_threshold(&self, event: &DdnsEvent) -> bool {
         let config = self.get_config();
-        let event = NotificationEvent::Ddns(event);
+        let context = NotificationTemplateContext::default();
+        let event = NotificationEvent::Ddns(event, &context);
         let mut matched_rules = 0usize;
 
         for rule in config
@@ -990,6 +1035,16 @@ impl NotificationSender {
                 let config = parse_instance_config::<TelegramConfig>(channel)?;
                 self.send_telegram_text(&config, text.to_string()).await
             }
+            NotificationChannel::Email => {
+                let config = parse_instance_config::<EmailConfig>(channel)?;
+                self.send_email_message(&config, title.to_string(), text.to_string())
+                    .await
+            }
+            NotificationChannel::ServerChan3 => {
+                let config = parse_instance_config::<ServerChan3Config>(channel)?;
+                self.send_serverchan3_message(&config, title.to_string(), text.to_string())
+                    .await
+            }
         }
     }
 
@@ -1031,6 +1086,8 @@ impl NotificationSender {
             NotificationChannel::Telegram => {
                 self.send_telegram_call(&config.telegram, call, force).await
             }
+            NotificationChannel::Email => Ok("Email skipped".to_string()),
+            NotificationChannel::ServerChan3 => Ok("Server酱3 skipped".to_string()),
         }
     }
 
@@ -1063,6 +1120,8 @@ impl NotificationSender {
                     .await
             }
             NotificationChannel::Telegram => self.send_telegram_ddns(&config.telegram, event).await,
+            NotificationChannel::Email => Ok("Email skipped".to_string()),
+            NotificationChannel::ServerChan3 => Ok("Server酱3 skipped".to_string()),
         }
     }
 
@@ -1106,6 +1165,8 @@ impl NotificationSender {
                 self.send_telegram_version_update(&config.telegram, event)
                     .await
             }
+            NotificationChannel::Email => Ok("Email skipped".to_string()),
+            NotificationChannel::ServerChan3 => Ok("Server酱3 skipped".to_string()),
         }
     }
 
@@ -1113,7 +1174,7 @@ impl NotificationSender {
         &self,
         config: &WebhookConfig,
         message: &SmsMessage,
-        context: &SmsTemplateContext,
+        context: &NotificationTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         if !force && (!config.enabled || !config.forward_sms) {
@@ -1156,7 +1217,12 @@ impl NotificationSender {
             return Err("Webhook URL is not configured".to_string());
         }
 
-        let payload = render_ddns_template(&config.ddns_template, event, true);
+        let payload = render_ddns_template(
+            &config.ddns_template,
+            event,
+            &NotificationTemplateContext::default(),
+            true,
+        );
         self.send_webhook_raw(config, &payload).await
     }
 
@@ -1172,7 +1238,12 @@ impl NotificationSender {
             return Err("Webhook URL is not configured".to_string());
         }
 
-        let payload = render_version_update_template(&config.update_template, event, true);
+        let payload = render_version_update_template(
+            &config.update_template,
+            event,
+            &NotificationTemplateContext::default(),
+            true,
+        );
         self.send_webhook_raw(config, &payload).await
     }
 
@@ -1256,7 +1327,7 @@ impl NotificationSender {
         &self,
         config: &BarkConfig,
         message: &SmsMessage,
-        context: &SmsTemplateContext,
+        context: &NotificationTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         if !should_send_sms(&config.common, force) {
@@ -1303,7 +1374,12 @@ impl NotificationSender {
         self.send_bark_message(
             config,
             "SimAdmin DDNS 通知".to_string(),
-            render_ddns_template(&config.common.ddns_template, event, false),
+            render_ddns_template(
+                &config.common.ddns_template,
+                event,
+                &NotificationTemplateContext::default(),
+                false,
+            ),
         )
         .await
     }
@@ -1322,7 +1398,12 @@ impl NotificationSender {
         self.send_bark_message(
             config,
             "SimAdmin 版本更新".to_string(),
-            render_version_update_template(&config.common.update_template, event, false),
+            render_version_update_template(
+                &config.common.update_template,
+                event,
+                &NotificationTemplateContext::default(),
+                false,
+            ),
         )
         .await
     }
@@ -1369,7 +1450,7 @@ impl NotificationSender {
         &self,
         config: &PushPlusConfig,
         message: &SmsMessage,
-        context: &SmsTemplateContext,
+        context: &NotificationTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         if !should_send_sms(&config.common, force) {
@@ -1405,7 +1486,12 @@ impl NotificationSender {
             return Ok("PushPlus skipped".to_string());
         }
 
-        let content = render_ddns_template(&config.common.ddns_template, event, false);
+        let content = render_ddns_template(
+            &config.common.ddns_template,
+            event,
+            &NotificationTemplateContext::default(),
+            false,
+        );
         self.send_pushplus_message(config, "SimAdmin DDNS 通知".to_string(), content)
             .await
     }
@@ -1419,7 +1505,12 @@ impl NotificationSender {
             return Ok("PushPlus skipped".to_string());
         }
 
-        let content = render_version_update_template(&config.common.update_template, event, false);
+        let content = render_version_update_template(
+            &config.common.update_template,
+            event,
+            &NotificationTemplateContext::default(),
+            false,
+        );
         self.send_pushplus_message(config, "SimAdmin 版本更新".to_string(), content)
             .await
     }
@@ -1456,7 +1547,7 @@ impl NotificationSender {
         &self,
         config: &WecomAppConfig,
         message: &SmsMessage,
-        context: &SmsTemplateContext,
+        context: &NotificationTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         if !should_send_sms(&config.common, force) {
@@ -1487,7 +1578,12 @@ impl NotificationSender {
         if !should_send_ddns(&config.common) {
             return Ok("企业微信应用消息 skipped".to_string());
         }
-        let text = render_ddns_template(&config.common.ddns_template, event, false);
+        let text = render_ddns_template(
+            &config.common.ddns_template,
+            event,
+            &NotificationTemplateContext::default(),
+            false,
+        );
         self.send_wecom_app_text(config, text).await
     }
 
@@ -1499,7 +1595,12 @@ impl NotificationSender {
         if !should_send_update(&config.common) {
             return Ok("企业微信应用消息 skipped".to_string());
         }
-        let text = render_version_update_template(&config.common.update_template, event, false);
+        let text = render_version_update_template(
+            &config.common.update_template,
+            event,
+            &NotificationTemplateContext::default(),
+            false,
+        );
         self.send_wecom_app_text(config, text).await
     }
 
@@ -1681,7 +1782,7 @@ impl NotificationSender {
         &self,
         config: &WecomRobotConfig,
         message: &SmsMessage,
-        context: &SmsTemplateContext,
+        context: &NotificationTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         if !should_send_sms(&config.common, force) {
@@ -1712,7 +1813,12 @@ impl NotificationSender {
         if !should_send_ddns(&config.common) {
             return Ok("企业微信群机器人 skipped".to_string());
         }
-        let text = render_ddns_template(&config.common.ddns_template, event, false);
+        let text = render_ddns_template(
+            &config.common.ddns_template,
+            event,
+            &NotificationTemplateContext::default(),
+            false,
+        );
         self.send_wecom_robot_text(config, text).await
     }
 
@@ -1724,7 +1830,12 @@ impl NotificationSender {
         if !should_send_update(&config.common) {
             return Ok("企业微信群机器人 skipped".to_string());
         }
-        let text = render_version_update_template(&config.common.update_template, event, false);
+        let text = render_version_update_template(
+            &config.common.update_template,
+            event,
+            &NotificationTemplateContext::default(),
+            false,
+        );
         self.send_wecom_robot_text(config, text).await
     }
 
@@ -1750,7 +1861,7 @@ impl NotificationSender {
         &self,
         config: &DingtalkRobotConfig,
         message: &SmsMessage,
-        context: &SmsTemplateContext,
+        context: &NotificationTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         if !should_send_sms(&config.common, force) {
@@ -1781,7 +1892,12 @@ impl NotificationSender {
         if !should_send_ddns(&config.common) {
             return Ok("钉钉群自定义机器人 skipped".to_string());
         }
-        let text = render_ddns_template(&config.common.ddns_template, event, false);
+        let text = render_ddns_template(
+            &config.common.ddns_template,
+            event,
+            &NotificationTemplateContext::default(),
+            false,
+        );
         self.send_dingtalk_robot_text(config, text).await
     }
 
@@ -1793,7 +1909,12 @@ impl NotificationSender {
         if !should_send_update(&config.common) {
             return Ok("钉钉群自定义机器人 skipped".to_string());
         }
-        let text = render_version_update_template(&config.common.update_template, event, false);
+        let text = render_version_update_template(
+            &config.common.update_template,
+            event,
+            &NotificationTemplateContext::default(),
+            false,
+        );
         self.send_dingtalk_robot_text(config, text).await
     }
 
@@ -1837,7 +1958,7 @@ impl NotificationSender {
         &self,
         config: &DingtalkAppConfig,
         message: &SmsMessage,
-        context: &SmsTemplateContext,
+        context: &NotificationTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         if !should_send_sms(&config.common, force) {
@@ -1868,7 +1989,12 @@ impl NotificationSender {
         if !should_send_ddns(&config.common) {
             return Ok("钉钉企业内部机器人 skipped".to_string());
         }
-        let text = render_ddns_template(&config.common.ddns_template, event, false);
+        let text = render_ddns_template(
+            &config.common.ddns_template,
+            event,
+            &NotificationTemplateContext::default(),
+            false,
+        );
         self.send_dingtalk_app_text(config, text).await
     }
 
@@ -1880,7 +2006,12 @@ impl NotificationSender {
         if !should_send_update(&config.common) {
             return Ok("钉钉企业内部机器人 skipped".to_string());
         }
-        let text = render_version_update_template(&config.common.update_template, event, false);
+        let text = render_version_update_template(
+            &config.common.update_template,
+            event,
+            &NotificationTemplateContext::default(),
+            false,
+        );
         self.send_dingtalk_app_text(config, text).await
     }
 
@@ -1980,7 +2111,7 @@ impl NotificationSender {
         &self,
         config: &FeishuRobotConfig,
         message: &SmsMessage,
-        context: &SmsTemplateContext,
+        context: &NotificationTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         if !should_send_sms(&config.common, force) {
@@ -2011,7 +2142,12 @@ impl NotificationSender {
         if !should_send_ddns(&config.common) {
             return Ok("飞书机器人 skipped".to_string());
         }
-        let text = render_ddns_template(&config.common.ddns_template, event, false);
+        let text = render_ddns_template(
+            &config.common.ddns_template,
+            event,
+            &NotificationTemplateContext::default(),
+            false,
+        );
         self.send_feishu_robot_text(config, text).await
     }
 
@@ -2023,7 +2159,12 @@ impl NotificationSender {
         if !should_send_update(&config.common) {
             return Ok("飞书机器人 skipped".to_string());
         }
-        let text = render_version_update_template(&config.common.update_template, event, false);
+        let text = render_version_update_template(
+            &config.common.update_template,
+            event,
+            &NotificationTemplateContext::default(),
+            false,
+        );
         self.send_feishu_robot_text(config, text).await
     }
 
@@ -2056,7 +2197,7 @@ impl NotificationSender {
         &self,
         config: &TelegramConfig,
         message: &SmsMessage,
-        context: &SmsTemplateContext,
+        context: &NotificationTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         if !should_send_sms(&config.common, force) {
@@ -2087,7 +2228,12 @@ impl NotificationSender {
         if !should_send_ddns(&config.common) {
             return Ok("Telegram skipped".to_string());
         }
-        let text = render_ddns_template(&config.common.ddns_template, event, false);
+        let text = render_ddns_template(
+            &config.common.ddns_template,
+            event,
+            &NotificationTemplateContext::default(),
+            false,
+        );
         self.send_telegram_text(config, text).await
     }
 
@@ -2099,7 +2245,12 @@ impl NotificationSender {
         if !should_send_update(&config.common) {
             return Ok("Telegram skipped".to_string());
         }
-        let text = render_version_update_template(&config.common.update_template, event, false);
+        let text = render_version_update_template(
+            &config.common.update_template,
+            event,
+            &NotificationTemplateContext::default(),
+            false,
+        );
         self.send_telegram_text(config, text).await
     }
 
@@ -2126,6 +2277,51 @@ impl NotificationSender {
 
         self.post_json("Telegram", &url, Value::Object(payload))
             .await
+    }
+
+    async fn send_serverchan3_message(
+        &self,
+        config: &ServerChan3Config,
+        title: String,
+        desp: String,
+    ) -> Result<String, String> {
+        let url = serverchan3_url(config)?;
+        let form = serverchan3_form_payload(config, &title, &desp);
+        let response = self
+            .client
+            .post(&url)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to send Server酱3 message: {}", e))?;
+
+        serverchan3_response_result(response.status(), response.text().await.unwrap_or_default())
+    }
+
+    async fn send_email_message(
+        &self,
+        config: &EmailConfig,
+        subject: String,
+        body: String,
+    ) -> Result<String, String> {
+        if config.smtp_host.trim().is_empty() {
+            return Err("SMTP 服务器未配置".to_string());
+        }
+        if config.sender_address.trim().is_empty() {
+            return Err("发件人邮箱未配置".to_string());
+        }
+
+        let sender = mailbox_from_config(&config.sender_address, &config.sender_name, "发件人")?;
+        let receivers = email_receivers_from_config(&config.receiver_addresses)?;
+        let message = build_email_message(config, sender, receivers, &subject, &body)?;
+        let mailer = build_email_transport(config)?;
+
+        mailer
+            .send(message)
+            .await
+            .map_err(|err| format!("Email 发送失败：{err}"))?;
+
+        Ok("Email test successful".to_string())
     }
 
     async fn post_json(&self, label: &str, url: &str, payload: Value) -> Result<String, String> {
@@ -2155,8 +2351,198 @@ where
         .map_err(|err| format!("Failed to parse {} channel config: {}", channel.name, err))
 }
 
+fn serverchan3_url(config: &ServerChan3Config) -> Result<String, String> {
+    let send_key = config.send_key.trim();
+    if send_key.is_empty() {
+        return Err("Server酱3 SendKey 未配置".to_string());
+    }
+    let uid = serverchan3_uid(config)
+        .ok_or_else(|| "Server酱3 UID 未配置，且无法从 SendKey 自动解析".to_string())?;
+    if !is_valid_serverchan3_uid(&uid) {
+        return Err("Server酱3 UID 只能包含字母、数字或短横线".to_string());
+    }
+
+    Ok(format!(
+        "https://{}.push.ft07.com/send/{}.send",
+        uid,
+        encode_path_segment(send_key)
+    ))
+}
+
+fn serverchan3_uid(config: &ServerChan3Config) -> Option<String> {
+    let uid = config.uid.trim();
+    if !uid.is_empty() {
+        return Some(uid.to_string());
+    }
+    serverchan3_uid_from_send_key(&config.send_key)
+}
+
+fn is_valid_serverchan3_uid(uid: &str) -> bool {
+    !uid.is_empty()
+        && uid
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+}
+
+fn serverchan3_uid_from_send_key(send_key: &str) -> Option<String> {
+    let send_key = send_key.trim();
+    let lower = send_key.to_ascii_lowercase();
+    let rest = lower.strip_prefix("sctp")?;
+    let digits_len = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .map(char::len_utf8)
+        .sum::<usize>();
+    if digits_len == 0 || rest.get(digits_len..=digits_len)? != "t" {
+        return None;
+    }
+    Some(rest[..digits_len].to_string())
+}
+
+fn serverchan3_form_payload(
+    config: &ServerChan3Config,
+    title: &str,
+    desp: &str,
+) -> Vec<(String, String)> {
+    let mut form = vec![
+        ("title".to_string(), title.to_string()),
+        ("desp".to_string(), desp.to_string()),
+    ];
+    if !config.channel.trim().is_empty() {
+        form.push(("channel".to_string(), config.channel.trim().to_string()));
+    }
+    if !config.openid.trim().is_empty() {
+        form.push(("group".to_string(), config.openid.trim().to_string()));
+    }
+    form
+}
+
+fn serverchan3_response_result(status: StatusCode, body: String) -> Result<String, String> {
+    if !status.is_success() {
+        return Err(format!("Server酱3 returned HTTP {}: {}", status, body));
+    }
+
+    let value = serde_json::from_str::<Value>(&body)
+        .map_err(|err| format!("Server酱3 返回内容不是合法 JSON：{}；{}", err, body))?;
+    let code = value
+        .get("code")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| format!("Server酱3 返回缺少 code 字段：{}", body))?;
+    if code != 0 {
+        let message = value
+            .get("message")
+            .or_else(|| value.get("msg"))
+            .and_then(Value::as_str)
+            .unwrap_or(&body);
+        return Err(format!("Server酱3 returned code {}: {}", code, message));
+    }
+
+    Ok(format!("Server酱3 test successful (status: {})", status))
+}
+
+fn split_receiver_addresses(value: &str) -> Vec<String> {
+    value
+        .split(|ch| matches!(ch, ',' | ';' | '\n' | '\r' | '，' | '；'))
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn mailbox_from_config(address: &str, name: &str, label: &str) -> Result<Mailbox, String> {
+    let address = address.trim();
+    if address.is_empty() {
+        return Err(format!("{label}邮箱未配置"));
+    }
+    let address = address
+        .parse::<Address>()
+        .map_err(|err| format!("{label}邮箱格式无效：{err}"))?;
+    let name = name.trim();
+    Ok(Mailbox::new(
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        },
+        address,
+    ))
+}
+
+fn email_receivers_from_config(value: &str) -> Result<Vec<Mailbox>, String> {
+    let addresses = split_receiver_addresses(value);
+    if addresses.is_empty() {
+        return Err("收件人邮箱未配置".to_string());
+    }
+    addresses
+        .iter()
+        .map(|address| mailbox_from_config(address, "", "收件人"))
+        .collect()
+}
+
+fn build_email_message(
+    config: &EmailConfig,
+    sender: Mailbox,
+    receivers: Vec<Mailbox>,
+    subject: &str,
+    body: &str,
+) -> Result<Message, String> {
+    let mut builder = Message::builder().from(sender).subject(subject);
+    for receiver in receivers {
+        builder = builder.to(receiver);
+    }
+
+    let part = match config.message_format.trim().to_ascii_lowercase().as_str() {
+        "" | "plain" | "text" => Ok(SinglePart::plain(body.to_string())),
+        "html" => Ok(SinglePart::html(body.to_string())),
+        other => Err(format!("不支持的 Email 消息格式：{other}")),
+    }?;
+
+    builder
+        .singlepart(part)
+        .map_err(|err| format!("构建 Email 消息失败：{err}"))
+}
+
+fn build_email_transport(
+    config: &EmailConfig,
+) -> Result<AsyncSmtpTransport<Tokio1Executor>, String> {
+    let host = config.smtp_host.trim();
+    let port = config.smtp_port.max(1);
+    let tls = match config.smtp_security.trim().to_ascii_lowercase().as_str() {
+        "" | "implicit_tls" | "tls" => {
+            let tls_parameters = email_tls_parameters(host, config.allow_insecure_tls)?;
+            Tls::Wrapper(tls_parameters)
+        }
+        "starttls" => {
+            let tls_parameters = email_tls_parameters(host, config.allow_insecure_tls)?;
+            Tls::Required(tls_parameters)
+        }
+        "none" => Tls::None,
+        other => return Err(format!("不支持的 SMTP 安全模式：{other}")),
+    };
+    let mut builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host)
+        .port(port)
+        .tls(tls);
+
+    if !config.username.trim().is_empty() || !config.password.is_empty() {
+        builder = builder.credentials(Credentials::new(
+            config.username.trim().to_string(),
+            config.password.clone(),
+        ));
+    }
+
+    Ok(builder.build())
+}
+
+fn email_tls_parameters(host: &str, allow_insecure: bool) -> Result<TlsParameters, String> {
+    TlsParameters::builder(host.to_string())
+        .dangerous_accept_invalid_certs(allow_insecure)
+        .dangerous_accept_invalid_hostnames(allow_insecure)
+        .build()
+        .map_err(|err| format!("构建 SMTP TLS 参数失败：{err}"))
+}
+
 fn rule_matches(rule: &NotificationRule, event: &NotificationEvent<'_>) -> bool {
-    if let NotificationEvent::SystemEvent(system_event) = event {
+    if let NotificationEvent::SystemEvent(system_event, _) = event {
         return rule
             .event_codes
             .iter()
@@ -2187,7 +2573,7 @@ fn rule_matches(rule: &NotificationRule, event: &NotificationEvent<'_>) -> bool 
 }
 
 fn ddns_failure_threshold_pending(rule: &NotificationRule, event: &NotificationEvent<'_>) -> bool {
-    let NotificationEvent::Ddns(ddns) = event else {
+    let NotificationEvent::Ddns(ddns, _) = event else {
         return false;
     };
     if ddns.status != "failed" {
@@ -2311,6 +2697,8 @@ impl NotificationChannel {
             NotificationChannel::DingtalkApp => "dingtalk_app",
             NotificationChannel::FeishuRobot => "feishu_robot",
             NotificationChannel::Telegram => "telegram",
+            NotificationChannel::Email => "email",
+            NotificationChannel::ServerChan3 => "serverchan3",
         }
     }
 
@@ -2325,12 +2713,14 @@ impl NotificationChannel {
             NotificationChannel::DingtalkApp => "钉钉企业内机器人",
             NotificationChannel::FeishuRobot => "飞书机器人",
             NotificationChannel::Telegram => "Telegram机器人",
+            NotificationChannel::Email => "Email",
+            NotificationChannel::ServerChan3 => "Server酱3",
         }
     }
 }
 
 #[allow(dead_code)]
-fn all_channels() -> [NotificationChannel; 9] {
+fn all_channels() -> [NotificationChannel; 11] {
     [
         NotificationChannel::Webhook,
         NotificationChannel::Bark,
@@ -2341,6 +2731,8 @@ fn all_channels() -> [NotificationChannel; 9] {
         NotificationChannel::DingtalkApp,
         NotificationChannel::FeishuRobot,
         NotificationChannel::Telegram,
+        NotificationChannel::Email,
+        NotificationChannel::ServerChan3,
     ]
 }
 
@@ -2364,6 +2756,8 @@ fn should_send_sms_to_channel(
         NotificationChannel::DingtalkApp => should_send_sms(&config.dingtalk_app.common, false),
         NotificationChannel::FeishuRobot => should_send_sms(&config.feishu_robot.common, false),
         NotificationChannel::Telegram => should_send_sms(&config.telegram.common, false),
+        NotificationChannel::Email => should_send_sms(&config.email.common, false),
+        NotificationChannel::ServerChan3 => should_send_sms(&config.serverchan3.common, false),
     }
 }
 
@@ -2397,6 +2791,8 @@ fn should_send_update_to_channel(
         NotificationChannel::DingtalkApp => should_send_update(&config.dingtalk_app.common),
         NotificationChannel::FeishuRobot => should_send_update(&config.feishu_robot.common),
         NotificationChannel::Telegram => should_send_update(&config.telegram.common),
+        NotificationChannel::Email => should_send_update(&config.email.common),
+        NotificationChannel::ServerChan3 => should_send_update(&config.serverchan3.common),
     }
 }
 
@@ -2407,15 +2803,20 @@ const DEFAULT_DDNS_JSON_TEMPLATE: &str = r#"{
     "text": "SimAdmin DDNS 通知\n域名: {{domains}}\nIP类型: {{ip_type}}\n新IP: {{new_ip}}\n旧IP: {{old_ip}}\n服务商: {{provider}}\n记录类型: {{record_type}}\n状态: {{status}}\n消息: {{message}}\n更新时间: {{timestamp}}"
   }
 }"#;
-const DEFAULT_UPDATE_TEXT_TEMPLATE: &str = "🚀 SimAdmin 发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\nCommit: {{Commit}}\n时间: {{时间}}\n来源: {{本机号码}}\n\n请前往 OTA 更新页面的在线更新模块检查更新，可一键下载并升级。";
+const DEFAULT_UPDATE_TEXT_TEMPLATE: &str = "🚀 SimAdmin 发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\n时间: {{时间}}\n来源: {{本机号码}}\n\n请前往 OTA 更新页面的在线更新模块检查更新，可一键下载并升级。";
 const DEFAULT_UPDATE_JSON_TEMPLATE: &str = r#"{
   "msg_type": "text",
   "content": {
-    "text": "🚀 SimAdmin 发现新版本\n固件包: {{asset_name}}\n版本号: {{version}}\nCommit: {{commit}}\n时间: {{time}}\n来源: {{own_number}}\n\n请前往 OTA 更新页面的在线更新模块检查更新，可一键下载并升级。"
+    "text": "🚀 SimAdmin 发现新版本\n固件包: {{asset_name}}\n版本号: {{version}}\n时间: {{time}}\n来源: {{own_number}}\n\n请前往 OTA 更新页面的在线更新模块检查更新，可一键下载并升级。"
   }
 }"#;
 
-fn render_ddns_template(template: &str, event: &DdnsEvent, escape_json: bool) -> String {
+fn render_ddns_template(
+    template: &str,
+    event: &DdnsEvent,
+    context: &NotificationTemplateContext,
+    escape_json: bool,
+) -> String {
     let domains = if event.domains.is_empty() {
         "-".to_string()
     } else {
@@ -2456,7 +2857,7 @@ fn render_ddns_template(template: &str, event: &DdnsEvent, escape_json: bool) ->
     let failure_count_value = event.failure_count.to_string();
     let failure_count = maybe_escape(&failure_count_value);
 
-    template
+    let rendered = template
         .replace("{{domains}}", &domains)
         .replace("{{domain}}", &domains)
         .replace("{{ip_type}}", &ip_type)
@@ -2478,7 +2879,8 @@ fn render_ddns_template(template: &str, event: &DdnsEvent, escape_json: bool) ->
         .replace("{{状态}}", &status)
         .replace("{{消息}}", &message)
         .replace("{{失败次数}}", &failure_count)
-        .replace("{{更新时间}}", &timestamp)
+        .replace("{{更新时间}}", &timestamp);
+    replace_common_variables(rendered, context, escape_json)
 }
 
 fn replace_own_number(template: String, own_number: &str) -> String {
@@ -2489,9 +2891,39 @@ fn replace_own_number(template: String, own_number: &str) -> String {
         .replace("{{本机号码}}", own_number)
 }
 
+fn common_own_number<'a>(context: &'a NotificationTemplateContext, fallback: &'a str) -> &'a str {
+    if context.own_number.trim().is_empty() {
+        fallback
+    } else {
+        context.own_number.as_str()
+    }
+}
+
+fn replace_common_variables(
+    template: String,
+    context: &NotificationTemplateContext,
+    escape_json: bool,
+) -> String {
+    let own_number = if escape_json {
+        escape_json_string(&context.own_number)
+    } else {
+        context.own_number.clone()
+    };
+    let carrier = if escape_json {
+        escape_json_string(&context.carrier)
+    } else {
+        context.carrier.clone()
+    };
+    replace_own_number(template, &own_number)
+        .replace("{{carrier}}", &carrier)
+        .replace("{{operator}}", &carrier)
+        .replace("{{运营商}}", &carrier)
+}
+
 fn render_version_update_template(
     template: &str,
     event: &VersionUpdateEvent,
+    context: &NotificationTemplateContext,
     escape_json: bool,
 ) -> String {
     let template = if template.trim().is_empty() && escape_json {
@@ -2511,21 +2943,18 @@ fn render_version_update_template(
     };
     let asset_name = maybe_escape(&event.asset_name);
     let version = maybe_escape(&event.version);
-    let commit = maybe_escape(&event.commit);
     let build_time_value = format_notification_time(&event.build_time);
     let build_time = maybe_escape(&build_time_value);
     let release_url = maybe_escape(&event.release_url);
     let timestamp_value = format_notification_time(&event.timestamp);
     let timestamp = maybe_escape(&timestamp_value);
-    let own_number = maybe_escape(&event.own_number);
+    let own_number = maybe_escape(common_own_number(context, &event.own_number));
 
     let rendered = template
         .replace("{{asset_name}}", &asset_name)
         .replace("{{file_name}}", &asset_name)
         .replace("{{firmware_name}}", &asset_name)
         .replace("{{version}}", &version)
-        .replace("{{commit}}", &commit)
-        .replace("{{Commit}}", &commit)
         .replace("{{build_time}}", &build_time)
         .replace("{{release_url}}", &release_url)
         .replace("{{timestamp}}", &timestamp)
@@ -2534,14 +2963,22 @@ fn render_version_update_template(
         .replace("{{固件包}}", &asset_name)
         .replace("{{文件名}}", &asset_name)
         .replace("{{版本号}}", &version)
-        .replace("{{提交}}", &commit)
         .replace("{{构建时间}}", &build_time)
         .replace("{{发布地址}}", &release_url)
         .replace("{{发布时间}}", &timestamp);
-    replace_own_number(rendered, &own_number)
+    replace_common_variables(
+        replace_own_number(rendered, &own_number),
+        context,
+        escape_json,
+    )
 }
 
-fn render_system_event_template(template: &str, event: &SystemEvent, escape_json: bool) -> String {
+fn render_system_event_template(
+    template: &str,
+    event: &SystemEvent,
+    context: &NotificationTemplateContext,
+    escape_json: bool,
+) -> String {
     let maybe_escape = |value: &str| {
         if escape_json {
             escape_json_string(value)
@@ -2562,7 +2999,7 @@ fn render_system_event_template(template: &str, event: &SystemEvent, escape_json
     let timestamp_value = format_notification_time(&event.timestamp);
     let timestamp = maybe_escape(&timestamp_value);
 
-    template
+    let rendered = template
         .replace("{{category}}", &category)
         .replace("{{category_label}}", &category_label)
         .replace("{{event_code}}", &event_code)
@@ -2585,13 +3022,14 @@ fn render_system_event_template(template: &str, event: &SystemEvent, escape_json
         .replace("{{状态编码}}", &status)
         .replace("{{对象}}", &entity)
         .replace("{{消息}}", &message)
-        .replace("{{时间}}", &timestamp)
+        .replace("{{时间}}", &timestamp);
+    replace_common_variables(rendered, context, escape_json)
 }
 
 fn render_automation_template(
     template: &str,
     event: &AutomationEvent,
-    own_number: &str,
+    context: &NotificationTemplateContext,
     escape_json: bool,
 ) -> String {
     let maybe_escape = |value: &str| {
@@ -2601,10 +3039,10 @@ fn render_automation_template(
             value.to_string()
         }
     };
-    
+
     let task_id = maybe_escape(&event.task_id);
     let task_name = maybe_escape(&event.task_name);
-    
+
     let task_type_label = match event.task_type.as_str() {
         "restart_baseband" => "重启基带",
         "reboot_device" => "重启设备",
@@ -2612,17 +3050,17 @@ fn render_automation_template(
         other => other,
     };
     let task_type = maybe_escape(task_type_label);
-    
+
     let status_label = match event.status.as_str() {
         "success" => "成功",
         "failed" => "失败",
         other => other,
     };
     let status = maybe_escape(status_label);
-    
+
     let message = maybe_escape(&event.message);
     let timestamp = maybe_escape(&event.timestamp);
-    let own_number = maybe_escape(own_number);
+    let own_number = maybe_escape(&context.own_number);
 
     let rendered = template
         .replace("{{task_id}}", &task_id)
@@ -2639,12 +3077,17 @@ fn render_automation_template(
         .replace("{{timestamp}}", &timestamp)
         .replace("{{触发时间}}", &timestamp)
         .replace("{{时间}}", &timestamp);
-    replace_own_number(rendered, &own_number)
+    replace_common_variables(
+        replace_own_number(rendered, &own_number),
+        context,
+        escape_json,
+    )
 }
 
 fn render_device_status_template(
     template: &str,
     report: &DeviceStatusReport,
+    context: &NotificationTemplateContext,
     escape_json: bool,
 ) -> String {
     let maybe_escape = |value: &str| {
@@ -2693,21 +3136,23 @@ fn render_device_status_template(
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            return format!("{header}{sections}{footer}")
+            let rendered = format!("{header}{sections}{footer}")
                 .replace("{{timestamp}}", &timestamp)
                 .replace("{{time}}", &timestamp)
                 .replace("{{时间}}", &timestamp);
+            return replace_common_variables(rendered, context, escape_json);
         }
     }
 
     let content = maybe_escape(&report.text());
-    template
+    let rendered = template
         .replace("{{status_content}}", &content)
         .replace("{{content}}", &content)
         .replace("{{timestamp}}", &timestamp)
         .replace("{{time}}", &timestamp)
         .replace("{{状态内容}}", &content)
-        .replace("{{时间}}", &timestamp)
+        .replace("{{时间}}", &timestamp);
+    replace_common_variables(rendered, context, escape_json)
 }
 
 fn robot_webhook_url(webhook_url: &str, key: &str, prefix: &str) -> Result<String, String> {
@@ -2838,7 +3283,7 @@ fn response_result(label: &str, status: StatusCode, body: String) -> Result<Stri
 fn render_sms_template(
     template: &str,
     message: &SmsMessage,
-    context: &SmsTemplateContext,
+    context: &NotificationTemplateContext,
     escape_json: bool,
 ) -> String {
     let content = if escape_json {
@@ -3051,7 +3496,7 @@ mod tests {
             status: "received".to_string(),
             pdu: None,
         };
-        let context = SmsTemplateContext::default();
+        let context = NotificationTemplateContext::default();
         let event = NotificationEvent::Sms {
             message: &message,
             context: &context,
@@ -3069,6 +3514,7 @@ mod tests {
             },
             channel_ids: Vec::new(),
             event_codes: Vec::new(),
+            title_template: String::new(),
             template: String::new(),
             quiet_hours: Vec::new(),
             ddns_failure_threshold: 1,
@@ -3099,6 +3545,7 @@ mod tests {
             matcher: RuleMatcher::default(),
             channel_ids: Vec::new(),
             event_codes: Vec::new(),
+            title_template: String::new(),
             template: String::new(),
             quiet_hours: Vec::new(),
             ddns_failure_threshold: 5,
@@ -3111,25 +3558,26 @@ mod tests {
             failure_count: 4,
             ..DdnsEvent::default()
         };
+        let context = NotificationTemplateContext::default();
 
-        let event = NotificationEvent::Ddns(&ddns);
+        let event = NotificationEvent::Ddns(&ddns, &context);
         assert!(ddns_failure_threshold_pending(&rule, &event));
 
         ddns.failure_count = 5;
-        let event = NotificationEvent::Ddns(&ddns);
+        let event = NotificationEvent::Ddns(&ddns, &context);
         assert!(!ddns_failure_threshold_pending(&rule, &event));
 
         ddns.failure_count = 6;
-        let event = NotificationEvent::Ddns(&ddns);
+        let event = NotificationEvent::Ddns(&ddns, &context);
         assert!(ddns_failure_threshold_pending(&rule, &event));
 
         ddns.failure_count = 10;
-        let event = NotificationEvent::Ddns(&ddns);
+        let event = NotificationEvent::Ddns(&ddns, &context);
         assert!(!ddns_failure_threshold_pending(&rule, &event));
 
         ddns.status = "updated".to_string();
         ddns.failure_count = 1;
-        let event = NotificationEvent::Ddns(&ddns);
+        let event = NotificationEvent::Ddns(&ddns, &context);
         assert!(!ddns_failure_threshold_pending(&rule, &event));
     }
 
@@ -3156,7 +3604,7 @@ mod tests {
             status: "received".to_string(),
             pdu: None,
         };
-        let context = SmsTemplateContext::default();
+        let context = NotificationTemplateContext::default();
 
         assert_eq!(
             render_sms_template("{{timestamp}}|{{time}}", &message, &context, false),
@@ -3175,7 +3623,7 @@ mod tests {
             status: "received".to_string(),
             pdu: None,
         };
-        let context = SmsTemplateContext {
+        let context = NotificationTemplateContext {
             own_number: "+10001".to_string(),
             ..Default::default()
         };
@@ -3192,6 +3640,103 @@ mod tests {
     }
 
     #[test]
+    fn builds_serverchan3_url_from_send_key_or_uid() {
+        let from_key = ServerChan3Config {
+            send_key: "sctp12345tsecret".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            serverchan3_url(&from_key).unwrap(),
+            "https://12345.push.ft07.com/send/sctp12345tsecret.send"
+        );
+
+        let manual_uid = ServerChan3Config {
+            uid: "user-1".to_string(),
+            send_key: "manual-secret".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            serverchan3_url(&manual_uid).unwrap(),
+            "https://user-1.push.ft07.com/send/manual%2Dsecret.send"
+        );
+    }
+
+    #[test]
+    fn serverchan3_requires_uid_when_send_key_cannot_be_parsed() {
+        let missing_uid = ServerChan3Config {
+            send_key: "manual-secret".to_string(),
+            ..Default::default()
+        };
+        assert!(serverchan3_url(&missing_uid).is_err());
+    }
+
+    #[test]
+    fn serverchan3_form_includes_optional_routing_fields() {
+        let config = ServerChan3Config {
+            channel: "9".to_string(),
+            openid: "openid-1".to_string(),
+            ..Default::default()
+        };
+        let form = serverchan3_form_payload(&config, "title", "content");
+
+        assert!(form.contains(&("title".to_string(), "title".to_string())));
+        assert!(form.contains(&("desp".to_string(), "content".to_string())));
+        assert!(form.contains(&("channel".to_string(), "9".to_string())));
+        assert!(form.contains(&("group".to_string(), "openid-1".to_string())));
+    }
+
+    #[test]
+    fn serverchan3_requires_zero_response_code() {
+        assert!(serverchan3_response_result(StatusCode::OK, r#"{"code":0}"#.to_string()).is_ok());
+        assert!(serverchan3_response_result(
+            StatusCode::OK,
+            r#"{"code":200,"message":"ok"}"#.to_string()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn email_receiver_parser_accepts_common_separators() {
+        let receivers = email_receivers_from_config(
+            "first@example.com; second@example.com\nthird@example.com，fourth@example.com",
+        )
+        .unwrap();
+
+        assert_eq!(receivers.len(), 4);
+    }
+
+    #[test]
+    fn email_receiver_parser_rejects_invalid_address() {
+        assert!(email_receivers_from_config("not-an-email").is_err());
+    }
+
+    #[test]
+    fn email_builders_validate_format_and_security() {
+        let mut config = EmailConfig {
+            smtp_host: "smtp.example.com".to_string(),
+            sender_address: "sender@example.com".to_string(),
+            receiver_addresses: "receiver@example.com".to_string(),
+            message_format: "plain".to_string(),
+            ..Default::default()
+        };
+        let sender = mailbox_from_config(&config.sender_address, "", "发件人").unwrap();
+        let receivers = email_receivers_from_config(&config.receiver_addresses).unwrap();
+        assert!(build_email_message(&config, sender, receivers, "subject", "body").is_ok());
+
+        config.message_format = "markdown".to_string();
+        let sender = mailbox_from_config(&config.sender_address, "", "发件人").unwrap();
+        let receivers = email_receivers_from_config(&config.receiver_addresses).unwrap();
+        assert!(build_email_message(&config, sender, receivers, "subject", "body").is_err());
+
+        config.message_format = "plain".to_string();
+        config.smtp_security = "starttls".to_string();
+        assert!(build_email_transport(&config).is_ok());
+
+        config.smtp_security = "invalid".to_string();
+        assert!(build_email_transport(&config).is_err());
+    }
+
+    #[test]
     fn renders_sms_carrier_variables() {
         let message = SmsMessage {
             id: 7,
@@ -3202,7 +3747,7 @@ mod tests {
             status: "received".to_string(),
             pdu: None,
         };
-        let context = SmsTemplateContext {
+        let context = NotificationTemplateContext {
             own_number: "+10001".to_string(),
             carrier: "中国联通".to_string(),
         };
@@ -3229,7 +3774,7 @@ mod tests {
             status: "received".to_string(),
             pdu: None,
         };
-        let context = SmsTemplateContext::default();
+        let context = NotificationTemplateContext::default();
 
         assert_eq!(
             render_sms_template(
@@ -3291,9 +3836,15 @@ mod tests {
             timestamp: "2026-05-14T16:30:45Z".to_string(),
             ..DdnsEvent::default()
         };
+        let context = NotificationTemplateContext::default();
 
         assert_eq!(
-            render_ddns_template("{{timestamp}}|{{time}}|{{更新时间}}", &event, false),
+            render_ddns_template(
+                "{{timestamp}}|{{time}}|{{更新时间}}",
+                &event,
+                &context,
+                false
+            ),
             "2026-05-15 00:30:45|2026-05-15 00:30:45|2026-05-15 00:30:45"
         );
     }
@@ -3303,21 +3854,114 @@ mod tests {
         let event = VersionUpdateEvent {
             asset_name: "simadmin_1.0.4.tar.gz".to_string(),
             version: "1.0.4".to_string(),
-            commit: "abc1234".to_string(),
             build_time: "2026-05-14T16:30:45Z".to_string(),
             release_url: "https://github.com/3899/SimAdmin/releases/tag/v1.0.4".to_string(),
             timestamp: "2026-05-14T17:00:00Z".to_string(),
             own_number: "+10001".to_string(),
         };
+        let context = NotificationTemplateContext::default();
 
         assert_eq!(
             render_version_update_template(
-                "{{asset_name}}|{{version}}|{{Commit}}|{{build_time}}|{{时间}}|{{本机号码}}",
+                "{{asset_name}}|{{version}}|{{build_time}}|{{时间}}|{{本机号码}}",
                 &event,
+                &context,
                 false
             ),
-            "simadmin_1.0.4.tar.gz|1.0.4|abc1234|2026-05-15 00:30:45|2026-05-15 01:00:00|+10001"
+            "simadmin_1.0.4.tar.gz|1.0.4|2026-05-15 00:30:45|2026-05-15 01:00:00|+10001"
         );
+    }
+
+    #[test]
+    fn renders_common_variables_for_non_sms_events() {
+        let context = NotificationTemplateContext {
+            own_number: "18888888888".to_string(),
+            carrier: "中国移动".to_string(),
+        };
+        let ddns = DdnsEvent::default();
+        assert_eq!(
+            render_ddns_template("{{本机号码}}|{{运营商}}", &ddns, &context, false),
+            "18888888888|中国移动"
+        );
+
+        let version = VersionUpdateEvent {
+            own_number: "+10001".to_string(),
+            ..VersionUpdateEvent::default()
+        };
+        assert_eq!(
+            render_version_update_template("{{本机号码}}|{{运营商}}", &version, &context, false),
+            "18888888888|中国移动"
+        );
+
+        let system = SystemEvent::new("baseband.restart", "info", "triggered", "modem", "ok");
+        assert_eq!(
+            render_system_event_template("{{本机号码}}|{{运营商}}", &system, &context, false),
+            "18888888888|中国移动"
+        );
+
+        let report = DeviceStatusReport {
+            lines: vec!["设备：在线，上电".to_string()],
+            timestamp: "2026-05-14T17:00:00Z".to_string(),
+        };
+        assert_eq!(
+            render_device_status_template("{{本机号码}}|{{运营商}}", &report, &context, false),
+            "18888888888|中国移动"
+        );
+
+        let automation = AutomationEvent {
+            task_id: "task-1".to_string(),
+            task_name: "发短信".to_string(),
+            task_type: "send_sms".to_string(),
+            status: "success".to_string(),
+            message: "ok".to_string(),
+            timestamp: "2026-05-14T17:00:00Z".to_string(),
+        };
+        assert_eq!(
+            render_automation_template("{{本机号码}}|{{运营商}}", &automation, &context, false),
+            "18888888888|中国移动"
+        );
+    }
+
+    #[test]
+    fn renders_rule_title_templates_with_sms_fallback() {
+        let context = NotificationTemplateContext {
+            own_number: "18888888888".to_string(),
+            carrier: "中国移动".to_string(),
+        };
+        let sms_with_code = SmsMessage {
+            id: 1,
+            direction: "incoming".to_string(),
+            phone_number: "16600001111".to_string(),
+            content: "验证码 123456".to_string(),
+            timestamp: "2026-05-14T17:00:00Z".to_string(),
+            status: "received".to_string(),
+            pdu: None,
+        };
+        let sms_event = NotificationEvent::Sms {
+            message: &sms_with_code,
+            context: &context,
+        };
+        assert_eq!(sms_event.render_title(""), "16600001111：验证码123456");
+
+        let sms_without_code = SmsMessage {
+            content: "普通短信内容".to_string(),
+            ..sms_with_code
+        };
+        let sms_event = NotificationEvent::Sms {
+            message: &sms_without_code,
+            context: &context,
+        };
+        assert_eq!(sms_event.render_title(""), "16600001111");
+        assert_eq!(
+            sms_event.render_title(&crate::config::default_rule_title_template(
+                NotificationEventType::Sms
+            )),
+            "16600001111"
+        );
+
+        let ddns = DdnsEvent::default();
+        let ddns_event = NotificationEvent::Ddns(&ddns, &context);
+        assert_eq!(ddns_event.render_title(""), "DDNS通知：18888888888");
     }
 
     #[test]

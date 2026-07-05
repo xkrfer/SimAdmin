@@ -252,8 +252,8 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async getEsimEuicc() {
-    return request<ApiResponse<EsimEuiccInfo>>('/esim/euicc', {
+  async getEsimEuicc(live = false) {
+    return request<ApiResponse<EsimEuiccInfo>>(live ? '/esim/euicc?live=1' : '/esim/euicc', {
       timeoutMs: 30000,
     })
   }
@@ -320,7 +320,17 @@ class SimAdminCurrentAPI {
   }
 
   async getSimInfo() {
-    return request<ApiResponse<SimInfo>>('/sim')
+    return request<ApiResponse<SimInfo>>('/sim', {
+      timeoutMs: 2500,
+    })
+  }
+
+  async refreshSimDetails() {
+    return request<ApiResponse<Record<string, never>>>('/sim/details/refresh', {
+      method: 'POST',
+      body: JSON.stringify({}),
+      timeoutMs: 2500,
+    })
   }
 
   async updateSimCache(data: UpdateSimCacheRequest) {
@@ -414,7 +424,9 @@ class SimAdminCurrentAPI {
   }
 
   async getSystemStats() {
-    return request<ApiResponse<SystemStatsResponse>>('/stats')
+    return request<ApiResponse<SystemStatsResponse>>('/stats', {
+      timeoutMs: 2500,
+    })
   }
 
   async getNetworkInterfaces() {

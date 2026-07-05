@@ -17,8 +17,9 @@ use tokio::sync::Mutex;
 use crate::config::ConfigManager;
 use crate::modem_manager::{find_at_device_path, find_qmi_device_path};
 use crate::models::{
-    EsimCommandResponse, EsimDownloadRequest, EsimEuiccInfo, EsimLpacRepairRequest, EsimLpacRepairResponse,
-    EsimLpacStatusResponse, EsimProfile, EsimProfilesResponse, WorkMode, WorkModeResponse,
+    EsimCommandResponse, EsimDownloadRequest, EsimEuiccInfo, EsimLpacRepairRequest,
+    EsimLpacRepairResponse, EsimLpacStatusResponse, EsimProfile, EsimProfilesResponse, WorkMode,
+    WorkModeResponse,
 };
 
 const ESIM_SHORT_TIMEOUT_SECS: u64 = 20;
@@ -934,13 +935,11 @@ async fn run_lpac_command(
 
     let value = match parsed_value {
         Some(val) => val,
-        None => {
-            serde_json::from_str::<Value>(&stdout).map_err(|err| {
-                EsimApiError::Command(format!(
-                    "Invalid JSON from lpac {action}: {err}; stdout: {stdout}"
-                ))
-            })?
-        }
+        None => serde_json::from_str::<Value>(&stdout).map_err(|err| {
+            EsimApiError::Command(format!(
+                "Invalid JSON from lpac {action}: {err}; stdout: {stdout}"
+            ))
+        })?,
     };
 
     Ok(normalize_lpac_response(
@@ -1149,6 +1148,7 @@ fn normalize_euicc_info(response: EsimCommandResponse) -> EsimEuiccInfo {
             })
         }),
         memory_total_customizable: None,
+        updated_at: None,
         raw: data,
     }
 }
@@ -1292,6 +1292,7 @@ pub fn normalize_profile(value: &Value) -> EsimProfile {
             .or_else(|| bool_from(ppr, &["deleteAllowed", "delete_allowed"]))
             .or_else(|| policy_allows(value, &["delete", "deletion"]))
             .or(Some(true)),
+        updated_at: None,
         raw: value.clone(),
     }
 }

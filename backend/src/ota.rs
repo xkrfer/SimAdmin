@@ -243,7 +243,6 @@ pub async fn check_and_notify_version_update(
     let event = VersionUpdateEvent {
         asset_name: asset.name.clone(),
         version: notify_version.clone(),
-        commit: release.target_commitish.clone().unwrap_or_default(),
         build_time: current_time.clone(),
         release_url: release.html_url.clone().unwrap_or_default(),
         timestamp: current_time,
